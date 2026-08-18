@@ -57,8 +57,8 @@ export interface WebUpgradeRoute {
 
 /** Gateway config: the listen address. */
 export interface Config {
-  /** Listen host; the two supported values are loopback and all-interfaces. */
-  host: '127.0.0.1' | '0.0.0.0'
+  /** Listen host; any bind address (loopback, all-interfaces, or a specific interface IP). */
+  host: string
   /** Listen port; zero requests an OS-assigned port. */
   port: number
 }
@@ -72,7 +72,7 @@ export interface Config {
  */
 export class WebServer extends Service {
   static Config: z<Config> = z.object({
-    host: z.union([z.const('127.0.0.1'), z.const('0.0.0.0')]).required(),
+    host: z.string().required(),
     port: z.natural().max(65535).required(),
   })
 

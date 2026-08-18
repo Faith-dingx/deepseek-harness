@@ -62,18 +62,18 @@ Examples:
 
 /**
  * Parse and provide the Web invocation as an ordinary Cordis service. The
- * command's action publishes the flags this invocation named; `--host 0.0.0.0`
- * or a non-numeric `--port` is a usage error, so on rejection (and on `--help`)
- * nothing is provided.
+ * command's action publishes the flags this invocation named; only a
+ * non-numeric `--port` is a usage error, so on rejection (and on `--help`)
+ * nothing is provided. `--host 0.0.0.0` (or any bind address) is allowed so a
+ * deployment can serve a LAN or remote reach at the caller's discretion; the
+ * `/api` browser-trust fence still gates non-loopback clients through
+ * `--trusted-host` authorities.
  * @param ctx - plugin context carrying the command line.
  */
 export function apply(ctx: Context): void {
   const program = webCommand()
   program.action(() => {
     const options = program.opts<WebOptions>()
-    if (options.host === '0.0.0.0') {
-      program.error('error: --host 0.0.0.0 is intentionally not supported yet for safety: it would expose remote code execution to the network; use 127.0.0.1 instead')
-    }
     if (options.port !== undefined && !/^\d+$/.test(options.port)) {
       program.error(`error: --port must be a number, got ${JSON.stringify(options.port)}`)
     }
