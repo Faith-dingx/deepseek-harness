@@ -279,7 +279,11 @@ export class SettingsScopeBinder extends Service {
       connection.api,
       spec,
       this.mirror,
-      connection.isLoopback ? 'host' : 'memory',
+      // Host persistence matches the shared mirror and the Host fence: the
+      // server refuses privileged calls from untrusted authorities, so a
+      // trusted LAN page must not be stranded in process-local 'memory' mode
+      // by a pre-handshake `isLoopback=false` read.
+      'host',
       this.schema,
     )
     ctx.effect(() => {

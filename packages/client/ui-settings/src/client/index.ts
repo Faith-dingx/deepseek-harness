@@ -51,7 +51,13 @@ export function apply(ctx: ClientContext): void {
   const connection = ctx.get('connection') as ConnectionHandle
   const mirror = new SettingsDescribeMirror(
     connection.api,
-    connection.isLoopback ? 'host' : 'memory',
+    // Always host persistence: the Host fence (`isTrustedApiRequest` +
+    // PRIVILEGED_METHODS) is the authoritative gate and admits loopback AND
+    // `--trusted-host` LAN authorities, so an untrusted page is refused by the
+    // server rather than by a client-side pre-decision. Persistence read once
+    // here would otherwise see the pre-handshake `isLoopback=false` on a
+    // trusted LAN page and strand settings in the process-local 'memory' mode.
+    'host',
   )
   ctx.effect(() => {
     const disposers = [
