@@ -9,6 +9,13 @@
 // `randomUUID` is unavailable, which broke workspace/settings UI. Backfill it
 // with a RFC 4122 v4 UUID built from crypto.getRandomValues, which browsers
 // do expose on insecure origins.
+//
+// The DOM lib types model `globalThis.crypto` as always present and
+// `randomUUID` as always defined, so oxlint flags the defensive null checks
+// below as "unnecessary" — but on an insecure origin (plain http on a LAN IP)
+// `crypto` is genuinely absent at runtime, which is exactly the case this
+// polyfill exists to cover. The checks are intentional; suppress the noise.
+/* oxlint-disable no-unnecessary-condition, unbound-method -- runtime-insecure-origin polyfill */
 if (typeof globalThis.crypto?.randomUUID !== 'function') {
   const cryptoObj: Crypto | undefined = globalThis.crypto
   const uuid = (): `${string}-${string}-${string}-${string}-${string}` => {
@@ -34,6 +41,7 @@ if (typeof globalThis.crypto?.randomUUID !== 'function') {
     ;(globalThis as Record<string, unknown>).crypto = { randomUUID: uuid }
   }
 }
+/* oxlint-enable no-unnecessary-condition, unbound-method */
 
 import { AppWebEntry } from '@deepseek-ai/dsh-client-web'
 
