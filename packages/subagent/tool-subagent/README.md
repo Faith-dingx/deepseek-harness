@@ -25,6 +25,7 @@ A foreground call passes the execution signal through startup and execution, awa
 | `agentOptions` | Provider-specific child `provider`, `model`, and positive `maxTokens`; the in-process provider treats explicit values as overrides of inherited parent options. |
 | `persona` | Per-child persona; requires provider `persona` capability. |
 | `toolFilter` | Per-child global-tool restriction; requires `toolFilter` capability. |
+| `presetId` | Optional preset every child runs on instead of inheriting its parent's composition: in-process providers join the child to that preset's exact tools, prompt sections, and skill catalog (an unknown or broken preset fails the child's start). Per-child `persona` and `toolFilter` still layer on top. |
 | `maxDepth` | Absolute delegation-depth cap, default `3` (`0` forbids delegation); a numeric cap requires the `depthLimit` capability and fails the mount without it. `'provider-managed'` sends no cap for an out-of-process provider whose budget belongs to the child harness. The tool stays visible at the cap; each attempted start checks the calling agent's current depth and returns an errored tool result when rejected. |
 
 ## Concurrency

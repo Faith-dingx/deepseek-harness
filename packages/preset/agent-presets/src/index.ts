@@ -325,6 +325,31 @@ export class AgentPresets extends Service {
   }
 
   /**
+   * Join one agent to a SPECIFIC preset's standing composition, by key.
+   *
+   * The sibling of {@link composeFrom} for a caller that already resolved the
+   * standing key asynchronously — a child subagent asked to run on a preset
+   * other than its parent's. The standing mount is ensured (composing plugins
+   * but starting no agent, session, or turn) BEFORE the child's synchronous
+   * creation window opens, so this bind is exactly as cheap and failure-free
+   * as `composeFrom`: it reads no roster, mounts nothing, and touches no file.
+   * A caller error is still rejected, as `@throws` records.
+   * @param agentCtx - the joining agent's scope context.
+   * @param standingKey - the standing scope key of the preset to join, as
+   *   {@link standingKeyFor} returned it.
+   * @returns the preset id the standing key names.
+   * @throws when `agentCtx` carries no scope, or has already joined a preset.
+   */
+  composeStanding(agentCtx: Context, standingKey: ScopeKey): string {
+    const agentKey = scopeOf(agentCtx)
+    if (agentKey === undefined) {
+      throw new Error('agent-presets: refusing to compose an unscoped context; the scope key is what joins an agent to its preset')
+    }
+    this.bindings.set(agentKey, bindScopeParent(agentKey, standingKey))
+    return (standingKey as { agentPreset: string }).agentPreset
+  }
+
+  /**
    * The preset one live agent runs on.
    *
    * Read from the live scope chain rather than from the session, so it answers

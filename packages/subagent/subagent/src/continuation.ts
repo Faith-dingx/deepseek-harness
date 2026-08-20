@@ -35,6 +35,7 @@ import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-ll
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
 import { foldSubagentDescriptor, snapshotSubagentDescriptor } from './descriptor.ts'
 import type { SubagentDescriptorData } from './descriptor.ts'
@@ -263,6 +264,12 @@ interface MaterializeInputs {
   }
   agentOptions: AgentOptions
   composition: { persona?: string | undefined; toolFilter?: ToolRestriction | undefined }
+  /**
+   * Standing scope key of the preset the child runs on INSTEAD of its parent's
+   * composition, resolved by the caller before the synchronous creation
+   * window; `undefined` when the child inherits its parent.
+   */
+  presetStandingKey?: ScopeKey
   signal: AbortSignal
 }
 
@@ -427,10 +434,18 @@ export class SubagentContinuationManager {
       ...agentModel !== undefined ? { agentModel } : {},
       ...request.persona !== undefined ? { persona: request.persona } : {},
       ...request.toolFilter !== undefined ? { toolFilter: request.toolFilter } : {},
+      ...request.presetId !== undefined ? { presetId: request.presetId } : {},
     })
     // Capture before the first await: a later parent switch belongs to the
     // parent's future, not to this child.
     const delegatedPolicies = captureDelegatedPolicyOverrides(parent)
+
+    // Resolve a named preset's standing composition before any await inside the
+    // creation lock: `standingKeyFor` is async, the child's creation window is
+    // not. An unknown or unusable preset rejects here, before any child exists.
+    const presetStandingKey = await this.resolveChildStanding(parent, request.presetId)
+    spec.signal.throwIfAborted()
+    this.assertAdmitting(parent)
 
     const prepared = await this.host.prepareContinuable(spec.provider, {
       sessionId: childId,
@@ -459,9 +474,14 @@ export class SubagentContinuationManager {
         childId,
         provider: spec.provider,
         parent,
-        create: { seed, meta: childSessionMeta(parent, childDepth, lineageSeedLength), delegatedPolicies },
+        create: {
+          seed,
+          meta: childSessionMeta(parent, childDepth, lineageSeedLength, request.presetId),
+          delegatedPolicies,
+        },
         agentOptions: resolveChildAgentOptions(parent, request.agentOptions, childDepth),
         composition: { persona: request.persona, toolFilter: request.toolFilter },
+        ...presetStandingKey !== undefined ? { presetStandingKey } : {},
         signal: spec.signal,
       })
       return this.submitMaterialized(
@@ -480,6 +500,30 @@ export class SubagentContinuationManager {
     if (this.ctx.agents.get(childId) !== undefined || this.ctx.get('sessions')?.get(childId) !== undefined) {
       throw new SubagentError(`subagent "${childId}" already exists`, 'DUPLICATE_CHILD')
     }
+  }
+
+  /**
+   * Resolve one named preset's standing scope key BEFORE a child's synchronous
+   * creation window: `standingKeyFor` is async, the window is not. Ensuring the
+   * mount composes plugins but starts no agent, session, or turn.
+   * @param parent - the delegating parent whose context carries the roster.
+   * @param presetId - the preset id the child runs on, or `undefined` to inherit.
+   * @returns the standing key, or `undefined` when the child inherits its parent.
+   * @throws when the roster is absent or the preset is unknown or unusable.
+   */
+  private async resolveChildStanding(
+    parent: Agent,
+    presetId: string | undefined,
+  ): Promise<ScopeKey | undefined> {
+    if (presetId === undefined) return undefined
+    const presets = parent.ctx.get('agentPresets')
+    if (presets === undefined) {
+      throw new SubagentError(
+        `subagent presetId "${presetId}" requested but the agent-presets service is not composed`,
+        'PRESET_UNAVAILABLE',
+      )
+    }
+    return await presets.standingKeyFor(presetId)
   }
 
   /**
@@ -972,6 +1016,10 @@ export class SubagentContinuationManager {
         'NOT_RESUMABLE',
       )
     }
+    // Resolve the declared preset BEFORE materialization: the roster's error for
+    // an unknown preset is the child's own configuration problem, not the
+    // generic unavailability this method otherwise reports.
+    const presetStandingKey = await this.resolveChildStanding(parent, descriptor.presetId)
     let activation: Activation
     try {
       activation = await this.materialize({
@@ -983,6 +1031,7 @@ export class SubagentContinuationManager {
           ...descriptor.agentModel !== undefined ? { model: descriptor.agentModel } : {},
         },
         composition: { persona: descriptor.persona, toolFilter: descriptor.toolFilter },
+        ...presetStandingKey !== undefined ? { presetStandingKey } : {},
         signal: options.signal,
       })
     } catch (error: unknown) {
@@ -1062,7 +1111,7 @@ export class SubagentContinuationManager {
       if (create !== undefined) {
         appendDelegatedPolicyOverrides((childCtx.agent as Agent).session, create.delegatedPolicies)
       }
-      applyChildComposition(childCtx, parent, inputs.composition)
+      applyChildComposition(childCtx, parent, inputs.composition, inputs.presetStandingKey)
       return this.setupRegistry.apply(childCtx)
     }
     const observer = this.host.observeActivation(provider, childId, parent)

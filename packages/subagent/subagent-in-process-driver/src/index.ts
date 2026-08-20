@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { foldConsumedWork } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 import { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import {
@@ -116,13 +117,27 @@ export async function startInProcessRun(
   // parent's future.
   const inherited = captureDelegatedPolicyOverrides(parent)
 
+  // Resolve a named preset's standing composition BEFORE the child's
+  // synchronous creation window: `standingKeyFor` is async, the window is not.
+  // Ensuring the mount composes plugins but starts no agent, session, or turn.
+  let presetStandingKey: ScopeKey | undefined
+  if (request.presetId !== undefined) {
+    const presets = parent.ctx.get('agentPresets')
+    if (presets === undefined) {
+      throw new Error(
+        `subagent presetId "${request.presetId}" requested but the agent-presets service is not composed`,
+      )
+    }
+    presetStandingKey = await presets.standingKeyFor(request.presetId)
+  }
+
   let structured: StructuredAttachment | undefined
   const setup = (childCtx: Context): void => {
     appendDelegatedPolicyOverrides((childCtx.agent as Agent).session, inherited)
     applyChildComposition(childCtx, parent, {
       persona: request.persona,
       toolFilter: request.toolFilter,
-    })
+    }, presetStandingKey)
     if (request.outputSchema !== undefined) {
       structured = attachStructuredRuntime(childCtx, request.outputSchema)
     }
@@ -131,7 +146,7 @@ export async function startInProcessRun(
 
   const handle = await parent.ctx.agents.create({
     sessionId: childId,
-    meta: childSessionMeta(parent, childDepth, activationBoundary),
+    meta: childSessionMeta(parent, childDepth, activationBoundary, request.presetId),
     ...seed !== undefined ? { seed } : {},
     agentOptions: resolveChildAgentOptions(parent, request.agentOptions, childDepth),
     signal: request.signal,

@@ -13,6 +13,7 @@ import type { Agent, AgentOptions, CreateAgentOptions } from '@deepseek-ai/dsh-a
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
+import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 // Type-only: make `ctx.get('sandboxPolicy')` / `ctx.get('approval')` resolve
 // to the policy services when composed — delegation consumes both
 // opportunistically (the documented `ctx.get` pattern), never as a hard dep —
@@ -93,19 +94,23 @@ export function resolveChildAgentOptions(
  * composition and its header still names the older one. Recording it is what
  * makes a child's history reconstructable: without it a cold read of the child
  * resolves the deployment default and rebuilds turns under a tool set the
- * child never had.
+ * child never had. A child asked to run on a NAMED preset records that preset
+ * instead — its own composition, which a cold read must reconstruct.
  * @param parent - the delegating parent agent.
  * @param childDepth - the resolved delegation depth to persist.
  * @param lineageSeedLength - how many leading events came from the parent's log.
+ * @param presetOverride - the preset id the child runs on when it does not
+ *   inherit its parent's composition, or `undefined` to inherit.
  * @returns the `meta` for `ctx.agents.create()`.
  */
 export function childSessionMeta(
   parent: Agent,
   childDepth: number,
   lineageSeedLength: number,
+  presetOverride?: string,
 ): NonNullable<CreateAgentOptions['meta']> {
   const parentHeader = parent.session.header
-  const agentPreset = parent.ctx.get('agentPresets')?.composedPreset(parent.ctx)
+  const agentPreset = presetOverride ?? parent.ctx.get('agentPresets')?.composedPreset(parent.ctx)
   return {
     ...parentHeader.cwd !== undefined ? { cwd: parentHeader.cwd } : {},
     ...agentPreset === undefined ? {} : { agentPreset },
@@ -155,17 +160,28 @@ export const SUBAGENT_DELEGATION_CONTEXT
  * prevent: with every model-facing row on the agent plane, a child that joins
  * no preset sees an empty tool registry and none of its parent's prompt
  * sections. Taking the parent as a parameter is what makes that omission
- * unrepresentable at the call sites.
+ * unrepresentable at the call sites. A child asked to run on a NAMED preset
+ * instead passes its pre-resolved standing key; the parent's composition is
+ * then neither inherited nor needed. Without that key the child inherits the
+ * parent's composition exactly as before.
  * @param childCtx - the child agent's scoped creation context.
  * @param parent - the delegating parent whose composition the child joins.
  * @param composition - the per-child persona and tool filter to install.
+ * @param presetStandingKey - optional standing scope key of the preset the
+ *   child runs on INSTEAD of its parent's, resolved by the caller before the
+ *   synchronous creation window (see the subagent in-process drivers).
  */
 export function applyChildComposition(
   childCtx: Context,
   parent: Agent,
   composition: ChildComposition,
+  presetStandingKey?: ScopeKey,
 ): void {
-  childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx)
+  if (presetStandingKey !== undefined) {
+    childCtx.get('agentPresets')?.composeStanding(childCtx, presetStandingKey)
+  } else {
+    childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx)
+  }
   // Order 120: after the sandbox:policy (110) and approval:policy (115) sentences.
   childCtx.systemPrompt.context({ name: 'subagent:delegation', order: 120, text: SUBAGENT_DELEGATION_CONTEXT })
   if (composition.persona !== undefined) {

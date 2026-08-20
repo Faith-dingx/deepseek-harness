@@ -146,6 +146,20 @@ export interface SubagentStartRequest {
    * persona (strict `{{…}}` interpolation against the registered variables).
    */
   readonly persona?: string
+  /**
+   * Optional preset id the child runs on instead of inheriting its parent's.
+   *
+   * When set, the in-process backends pre-resolve the named preset's standing
+   * composition (composing plugins but starting no agent, session, or turn)
+   * before the child's creation window, and join the child to THAT composition
+   * rather than its parent's — its exact tools, prompt sections, and skill
+   * catalog, with the parent's history excluded. The named preset must exist
+   * and mount; an unknown id rejects the start with the roster's error. A
+   * child composed this way still applies this request's `persona` shadow and
+   * `toolFilter` intersect on top. Omission preserves the current behavior:
+   * the child inherits its parent's composition.
+   */
+  readonly presetId?: string
 }
 
 /**

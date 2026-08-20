@@ -16,7 +16,7 @@ import Include from '@deepseek-ai/cordis-plugin-include'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import AgentPresets from '@deepseek-ai/dsh-agent-presets'
+import AgentPresets, { PresetMountError } from '@deepseek-ai/dsh-agent-presets'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { snapshotSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
 import { MockAdapter, textResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
@@ -130,6 +130,71 @@ describe('a child agent composed in-process', () => {
 
     expect(ctx.tools.schemas(run.localAgent).map(schema => schema.name)).toEqual(['reviewing_only'])
     expect(run.localAgent?.session.header.agentPreset).toBe('reviewing')
+    await run.dispose()
+  })
+
+  it('composes a child from a named preset instead of its parent', async () => {
+    const { ctx, parent } = await setupPresetHost()
+    // The parent runs on `coding`; the child must run on `reviewing` alone.
+    const run = await startInProcessRun(
+      { ...spawnRequest(parent), presetId: 'reviewing' },
+      {},
+    )
+    await run.result
+
+    expect(ctx.tools.schemas(run.localAgent).map(schema => schema.name)).toEqual(['reviewing_only'])
+    expect(run.localAgent?.session.header.agentPreset).toBe('reviewing')
+    await run.dispose()
+  })
+
+  it('still layers a persona and tool filter over the named preset', async () => {
+    const { ctx, parent } = await setupPresetHost()
+
+    const run = await startInProcessRun(
+      { ...spawnRequest(parent), presetId: 'reviewing', toolFilter: { deny: ['reviewing_only'] } },
+      {},
+    )
+    await run.result
+
+    expect(ctx.tools.schemas(run.localAgent).map(schema => schema.name)).toEqual([])
+    expect(run.localAgent?.session.header.agentPreset).toBe('reviewing')
+    await run.dispose()
+  })
+
+  it('rejects an unknown presetId with the roster\'s clear error', async () => {
+    const { parent } = await setupPresetHost()
+
+    await expect(startInProcessRun({ ...spawnRequest(parent), presetId: 'nope' }, {}))
+      .rejects.toThrow(/preset "nope" not found/)
+  })
+
+  it('rejects a broken presetId with the mount\'s PresetMountError', async () => {
+    const { parent } = await setupPresetHost()
+
+    const failure = await startInProcessRun({ ...spawnRequest(parent), presetId: 'broken' }, {})
+      .then(() => undefined, (error: unknown) => error)
+
+    // The mount wraps the unusable composition in PresetMountError naming the
+    // preset, rather than failing the child with a generic start error.
+    expect(failure).toBeInstanceOf(PresetMountError)
+    expect(String(failure)).toMatch(/preset "broken" failed to mount/)
+  })
+
+  it('shadows the named preset composition with a per-child persona', async () => {
+    const { ctx, parent } = await setupPresetHost()
+
+    const run = await startInProcessRun(
+      { ...spawnRequest(parent), presetId: 'reviewing', persona: 'You are the reviewer.' },
+      {},
+    )
+    await run.result
+
+    // The preset still supplies its tool set; the per-child persona shadows the
+    // deployment persona section on the child alone.
+    expect(ctx.tools.schemas(run.localAgent).map(schema => schema.name)).toEqual(['reviewing_only'])
+    expect(run.localAgent?.session.events.some(event =>
+      event.type === 'request/header'
+      && JSON.stringify(event.data).includes('You are the reviewer.'))).toBe(true)
     await run.dispose()
   })
 })

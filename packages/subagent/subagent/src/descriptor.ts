@@ -44,7 +44,7 @@ declare module '@deepseek-ai/dsh-session/types' {
  * Supporting another composition input is a deliberate version change, never
  * an implicit extra field.
  */
-export const SUBAGENT_DESCRIPTOR_VERSION = 2
+export const SUBAGENT_DESCRIPTOR_VERSION = 3
 
 /** Fields shared by every supported `subagent/descriptor` payload. */
 interface SubagentDescriptorBase {
@@ -80,6 +80,11 @@ export interface ContinuableSubagentDescriptorData extends SubagentDescriptorBas
   readonly persona?: string
   /** Child tool scoping reapplied on resume. */
   readonly toolFilter?: ToolRestriction
+  /**
+   * The preset id the child runs on INSTEAD of its parent's composition, so a
+   * cold resume reconstructs the same composition it was created under.
+   */
+  readonly presetId?: string
 }
 
 /** The supported durable subagent identity and optional continuation composition. */
@@ -115,6 +120,8 @@ export interface ContinuableSubagentDescriptorInput extends SubagentDescriptorIn
   readonly persona?: string
   /** Requested child tool scoping. */
   readonly toolFilter?: ToolRestriction
+  /** Requested preset id the child runs on instead of its parent's composition. */
+  readonly presetId?: string
 }
 
 /** Inputs {@link snapshotSubagentDescriptor} validates and detaches. */
@@ -135,6 +142,7 @@ const CONTINUABLE_DESCRIPTOR_KEYS = new Set([
   'agentModel',
   'persona',
   'toolFilter',
+  'presetId',
 ])
 const TOOL_FILTER_KEYS = new Set(['allow', 'deny'])
 
@@ -232,6 +240,7 @@ function parseSubagentDescriptor(value: unknown): SubagentDescriptorData | undef
   const agentProvider = optionalString(value, 'agentProvider')
   const agentModel = optionalString(value, 'agentModel')
   const persona = optionalString(value, 'persona')
+  const presetId = optionalString(value, 'presetId')
   const toolFilter = Object.hasOwn(value, 'toolFilter')
     ? parseToolFilter(value['toolFilter'])
     : undefined
@@ -243,6 +252,7 @@ function parseSubagentDescriptor(value: unknown): SubagentDescriptorData | undef
     ...agentProvider !== undefined ? { agentProvider } : {},
     ...agentModel !== undefined ? { agentModel } : {},
     ...persona !== undefined ? { persona } : {},
+    ...presetId !== undefined ? { presetId } : {},
     ...toolFilter !== undefined ? { toolFilter } : {},
   }
 }
@@ -284,6 +294,7 @@ export function snapshotSubagentDescriptor(input: SubagentDescriptorInput): Suba
       ...input.agentProvider !== undefined ? { agentProvider: input.agentProvider } : {},
       ...input.agentModel !== undefined ? { agentModel: input.agentModel } : {},
       ...input.persona !== undefined ? { persona: input.persona } : {},
+      ...input.presetId !== undefined ? { presetId: input.presetId } : {},
       ...input.toolFilter !== undefined ? { toolFilter: input.toolFilter } : {},
     }
   const snapshot = snapshotJsonValue(candidate)

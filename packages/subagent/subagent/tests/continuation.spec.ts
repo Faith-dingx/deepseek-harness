@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
+import Loader from '@deepseek-ai/cordis-plugin-loader'
+import Include from '@deepseek-ai/cordis-plugin-include'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
+import AgentPresets from '@deepseek-ai/dsh-agent-presets'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
@@ -93,6 +97,33 @@ async function setup(script: Script, options: { persistence?: boolean } = {}) {
   const adapter = new MockAdapter(script)
   const booted = await setupWith(adapter, options)
   return { ...booted, adapter }
+}
+
+const PRESET_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'fixtures')
+const PRESET_ROOTS = [{ path: join(PRESET_FIXTURES, 'presets'), trust: 'system' as const }]
+
+/**
+ * The continuable stack PLUS an agent-preset roster over the package-local
+ * fixture presets. The parent agent is created bare (joined to no preset), so
+ * a child that ignores `presetId` and inherits its parent would see no tools.
+ */
+async function setupPresetContinuable(adapter: LlmAdapter) {
+  const ctx = new Context()
+  ctx.baseUrl = pathToFileURL(PRESET_FIXTURES).href + '/'
+  await ctx.plugin(Loader)
+  ctx.loader.builtins.include = Include
+  await mountAgentLoopTestDependencies(ctx)
+  const root = mkdtempSync(join(tmpdir(), 'dsh-subagent-preset-continuation-'))
+  roots.push(root)
+  const persistenceFiber = await ctx.plugin(JsonlSessionPersistence, { root })
+  await ctx.plugin(AgentLoop, { agents: [] })
+  await ctx.plugin(AgentPresets, { default: 'coding', roots: PRESET_ROOTS, includeUserRoot: false })
+  await ctx.plugin(SubagentRuntime)
+  await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
+  await ctx.plugin(SubagentFork, { providerName: 'fork' })
+  ctx.llm.registerAdapter(['mock'], adapter)
+  const parent = ctx.agentLoop.create(SessionId('parent'), { provider: 'mock', model: 'mock' })
+  return { ctx, parent, persistenceFiber, root }
 }
 
 const testSignal = new AbortController().signal
@@ -480,6 +511,71 @@ describe('SubagentRuntime.startContinuable', () => {
     await waitNoActivation(ctx, started.childId)
     const resumed = await ctx.sessionPersistence.load(started.childId)
     expect(hasUserText(resumed.events, 'resume it')).toBe(true)
+  })
+})
+
+describe('SubagentRuntime.startContinuable with a named preset', () => {
+  it('composes the child from the named preset instead of its parent', async () => {
+    const release = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter([{ chunks: textResponse('child done'), gate: release.promise }])
+    const { ctx, parent } = await setupPresetContinuable(adapter)
+    const started = await ctx.subagents.startContinuable({
+      ...startSpec(parent),
+      request: { prompt: message('child task'), parent, presetId: 'reviewing' },
+    })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })
+    const child = ctx.agents.get(started.childId)
+    expect(child).toBeDefined()
+    // The parent joined no preset, so only the named preset can supply tools.
+    expect(ctx.agentPresets.composedPreset(child!.ctx)).toBe('reviewing')
+    expect(ctx.tools.schemas(child).map(schema => schema.name)).toEqual(['reviewing_only'])
+    release.resolve(undefined)
+    await waitNoActivation(ctx, started.childId)
+  })
+
+  it('records the named preset on the durable header and descriptor', async () => {
+    const { ctx, parent } = await setupPresetContinuable(new MockAdapter([textResponse('child done')]))
+    const started = await ctx.subagents.startContinuable({
+      ...startSpec(parent),
+      request: { prompt: message('child task'), parent, presetId: 'reviewing' },
+    })
+    await waitNoActivation(ctx, started.childId)
+
+    const loaded = await ctx.sessionPersistence.load(started.childId)
+    expect(loaded.meta.agentPreset).toBe('reviewing')
+    const descriptor = loaded.events.find(event => event.type === 'subagent/descriptor')
+    expect(descriptor?.data).toMatchObject({ presetId: 'reviewing' })
+  })
+
+  it('cold-resumes the child onto the same named preset', async () => {
+    const releaseSecond = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter([
+      { chunks: textResponse('first') },
+      { chunks: textResponse('resumed'), gate: releaseSecond.promise },
+    ])
+    const { ctx, parent } = await setupPresetContinuable(adapter)
+    const started = await ctx.subagents.startContinuable({
+      ...startSpec(parent),
+      request: { prompt: message('child task'), parent, presetId: 'reviewing' },
+    })
+    await waitNoActivation(ctx, started.childId)
+
+    await followup(ctx, parent, started.childId, message('resume it'))
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(2) })
+    const resumed = ctx.agents.get(started.childId)
+    expect(resumed).toBeDefined()
+    expect(ctx.agentPresets.composedPreset(resumed!.ctx)).toBe('reviewing')
+    expect(ctx.tools.schemas(resumed).map(schema => schema.name)).toEqual(['reviewing_only'])
+    releaseSecond.resolve(undefined)
+    await waitNoActivation(ctx, started.childId)
+  })
+
+  it('rejects an unknown presetId with the roster\'s clear error', async () => {
+    const { ctx, parent } = await setupPresetContinuable(new MockAdapter([textResponse('unused')]))
+    await expect(ctx.subagents.startContinuable({
+      ...startSpec(parent),
+      request: { prompt: message('child task'), parent, presetId: 'nope' },
+    })).rejects.toThrow(/preset "nope" not found/)
   })
 })
 

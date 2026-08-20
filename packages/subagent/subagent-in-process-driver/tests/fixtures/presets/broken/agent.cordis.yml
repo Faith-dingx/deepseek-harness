@@ -1,0 +1,4 @@
+# A preset whose single row cannot load: the mount wraps the loader failure in
+# PresetMountError, so a child asked to run on it must fail with a clear error.
+- id: missing
+  name: ../../plugins/does-not-exist.js

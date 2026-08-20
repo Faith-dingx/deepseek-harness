@@ -227,6 +227,49 @@ describe('composing a child agent from its parent', () => {
   })
 })
 
+describe('composing a child agent from a named preset standing key', () => {
+  /** Create one agent joined to the standing composition `presetId` names. */
+  async function childOn(ctx: Context, id: string, presetId: string): Promise<Agent> {
+    const standingKey = await ctx.agentPresets.standingKeyFor(presetId)
+    const handle = await ctx.agents.create({
+      sessionId: SessionId(id),
+      setup: (childCtx: Context) => void ctx.agentPresets.composeStanding(childCtx, standingKey),
+    })
+    return handle.agent
+  }
+
+  it('composes the child from the named preset rather than any parent', async () => {
+    const child = await childOn(ctx, 'sess-standing-child', 'minimal')
+
+    expect(toolNames(ctx, child)).toEqual(['beta'])
+    const prompt = await ctx.systemPrompt.assemble(assembleContextFor(child))
+    expect(prompt.sections.map(section => section.name)).toContain('preset:beta')
+  })
+
+  it('reports the preset id the standing key names', async () => {
+    const child = await childOn(ctx, 'sess-standing-named', 'minimal')
+
+    expect(ctx.agentPresets.composedPreset(child.ctx)).toBe('minimal')
+  })
+
+  it('returns the preset id when composing', async () => {
+    const standingKey = await ctx.agentPresets.standingKeyFor('minimal')
+    let composed: string | undefined
+    await ctx.agents.create({
+      sessionId: SessionId('sess-standing-return'),
+      setup: (childCtx: Context) => { composed = ctx.agentPresets.composeStanding(childCtx, standingKey) },
+    })
+
+    expect(composed).toBe('minimal')
+  })
+
+  it('refuses to compose an unscoped context', async () => {
+    const standingKey = await ctx.agentPresets.standingKeyFor('minimal')
+
+    expect(() => ctx.agentPresets.composeStanding(ctx, standingKey)).toThrow(/unscoped context/)
+  })
+})
+
 describe('rejecting a composition that cannot be used', () => {
   it('refuses to mount into a context that carries no agent scope', async () => {
     await expect(ctx.agentPresets.mount(ctx, 'standard'))

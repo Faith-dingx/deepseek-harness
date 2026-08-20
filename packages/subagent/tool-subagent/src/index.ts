@@ -67,6 +67,13 @@ export interface Config {
     deny?: string[]
   }
   /**
+   * Optional preset id every child runs on instead of inheriting its parent's
+   * composition. In-process providers join the child to the named preset's
+   * exact tools and prompt sections (an unknown or broken preset fails the
+   * child's start). Per-child `persona` and `toolFilter` still layer on top.
+   */
+  presetId?: string
+  /**
    * Maximum child depth: a non-negative safe integer (default `3`; `0` forbids
    * delegation entirely), or `'provider-managed'` to send no cap. A numeric cap
    * requires the provider's `depthLimit` capability (mount fails loud
@@ -95,6 +102,7 @@ export const Config: z<Config> = z.object({
     allow: z.array(z.string()).default(undefined as unknown as string[]),
     deny: z.array(z.string()).default(undefined as unknown as string[]),
   }).default(undefined as unknown as { allow: string[]; deny: string[] }),
+  presetId: z.string(),
   maxDepth: z.union([z.natural().max(Number.MAX_SAFE_INTEGER), z.const('provider-managed' as const)]).default(3),
 })
 
@@ -390,6 +398,7 @@ export function apply(ctx: Context, config: Config): void {
           ...config.agentOptions !== undefined ? { agentOptions: config.agentOptions } : {},
           ...config.persona !== undefined ? { persona: config.persona } : {},
           ...config.toolFilter !== undefined ? { toolFilter: config.toolFilter } : {},
+          ...config.presetId !== undefined ? { presetId: config.presetId } : {},
           ...maxDepth !== undefined ? { maxDepth } : {},
         }
 

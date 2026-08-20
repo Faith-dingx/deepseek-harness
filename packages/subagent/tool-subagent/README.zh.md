@@ -25,6 +25,7 @@
 | `agentOptions` | 传给具体提供方的子 agent `provider`、`model` 和正整数 `maxTokens`；进程内提供方会用显式值覆盖继承的父级选项。 |
 | `persona` | 每个子 agent 独立的 persona；要求提供方具备 `persona` 能力。 |
 | `toolFilter` | 每个子 agent 独立的全局工具限制；要求提供方具备 `toolFilter` 能力。 |
+| `presetId` | 可选：每个子 agent 运行的 preset，而非继承其父的组合——进程内提供方把子 agent 加入该 preset 的精确工具、提示段与技能目录（未知或损坏的 preset 会令子 agent 启动失败）。每子 agent 的 `persona` 与 `toolFilter` 仍在其上层叠加。 |
 | `maxDepth` | 绝对委派深度上限，默认 `3`（`0` 禁止委派）；数值上限要求 `depthLimit` 能力，缺失时挂载失败。对于预算由子 harness 拥有的进程外提供方，`'provider-managed'` 不发送上限。工具在达到上限时仍然可见；每次尝试启动都会检查调用 agent 的当前深度，被拒绝时返回出错的工具结果。 |
 
 ## 并发
