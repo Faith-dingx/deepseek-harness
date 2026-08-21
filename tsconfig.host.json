@@ -291,6 +291,7 @@
     { "path": "./packages/extensions/cordis-host-runner" },
     { "path": "./packages/extensions/tool-cordis" },
     { "path": "./packages/extensions/guard-main-agent" },
+    { "path": "./packages/extensions/dsh-injection-manager" },
     { "path": "./packages/hooks/hook-protocol" },
     { "path": "./packages/hooks/hooks-claude-code" },
     { "path": "./packages/hooks/hooks-codex" },
