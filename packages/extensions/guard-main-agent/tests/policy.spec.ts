@@ -1,0 +1,203 @@
+import { describe, expect, it } from 'vitest'
+import {
+  CODE_CLASS_TOOLS,
+  DELEGATION_TOOLS,
+  DIAGNOSTIC_TOOLS,
+  WRITE_TOOLS,
+  isDiagnosticTool,
+  parseClassifierOutput,
+  resolveVerdict,
+} from '../src/policy.ts'
+import type { FallbackMode, ResolvedGuardConfig } from '../src/types.ts'
+
+const config = (options: { fallback?: FallbackMode; diagnosticFallback?: FallbackMode } = {}): ResolvedGuardConfig => ({
+  classifierEndpoint: 'http://classifier:9888/v1/chat/completions',
+  classifierModel: 'agnes/agnes-2.5-flash',
+  fallback: options.fallback ?? 'close',
+  diagnosticFallback: options.diagnosticFallback ?? 'open',
+  timeoutMs: 5000,
+  cacheTtlMs: 600000,
+  cacheMax: 50,
+  presetId: 'main-agent',
+  filePolicyPath: null,
+  boundaryDocPath: null,
+})
+
+describe('guard tool classification sets', () => {
+  it('WRITE_TOOLS covers the machine-gated file-writing tools', () => {
+    expect(WRITE_TOOLS.has('write')).toBe(true)
+    expect(WRITE_TOOLS.has('edit')).toBe(true)
+    expect(WRITE_TOOLS.has('str_replace')).toBe(true)
+    expect(WRITE_TOOLS.has('browser_upload_file')).toBe(true)
+  })
+
+  it('DIAGNOSTIC_TOOLS covers read-only inspection tools', () => {
+    expect(DIAGNOSTIC_TOOLS.has('read')).toBe(true)
+    expect(DIAGNOSTIC_TOOLS.has('grep')).toBe(true)
+    expect(DIAGNOSTIC_TOOLS.has('lsp')).toBe(true)
+    expect(isDiagnosticTool('read')).toBe(true)
+    expect(isDiagnosticTool('bash')).toBe(false)
+  })
+
+  it('DELEGATION_TOOLS covers the sanctioned subagent dispatch channel', () => {
+    expect(DELEGATION_TOOLS.has('call_code_agent')).toBe(true)
+    expect(DELEGATION_TOOLS.has('call_check_agent')).toBe(true)
+    expect(DELEGATION_TOOLS.has('call_plan_reviewer')).toBe(true)
+    expect(DELEGATION_TOOLS.has('subagent')).toBe(true)
+    expect(DELEGATION_TOOLS.has('subagent_fork')).toBe(true)
+  })
+
+  it('CODE_CLASS_TOOLS covers code-executing tools that must fail close', () => {
+    expect(CODE_CLASS_TOOLS.has('bash')).toBe(true)
+    expect(CODE_CLASS_TOOLS.has('terminal')).toBe(true)
+  })
+})
+
+describe('parseClassifierOutput', () => {
+  it('parses the object form with all fields', () => {
+    const out = parseClassifierOutput(JSON.stringify({
+      verdict: 'block',
+      reason: 'main agent must not implement code itself',
+      delegateTo: 'code-agent',
+      reviewPrompt: null,
+    }))
+    expect(out).toEqual({
+      verdict: 'block',
+      reason: 'main agent must not implement code itself',
+      delegateTo: 'code-agent',
+      reviewPrompt: null,
+    })
+  })
+
+  it('accepts missing optional fields', () => {
+    const out = parseClassifierOutput(JSON.stringify({ verdict: 'allow' }))
+    expect(out).toEqual({ verdict: 'allow' })
+  })
+
+  it('accepts bare text tokens allow/block (pure-text tolerance)', () => {
+    expect(parseClassifierOutput('block')?.verdict).toBe('block')
+    expect(parseClassifierOutput('ALLOW')?.verdict).toBe('allow')
+    expect(parseClassifierOutput('  allow  ')?.verdict).toBe('allow')
+  })
+
+  it('returns null for an array form (not a valid verdict payload)', () => {
+    expect(parseClassifierOutput('["a","b"]')).toBeNull()
+    expect(parseClassifierOutput('[1,2,3]')).toBeNull()
+  })
+
+  it('returns null for unreadable or empty output', () => {
+    expect(parseClassifierOutput('')).toBeNull()
+    expect(parseClassifierOutput('garbage')).toBeNull()
+    expect(parseClassifierOutput(null)).toBeNull()
+  })
+
+  it('returns null for an unknown verdict value', () => {
+    expect(parseClassifierOutput(JSON.stringify({ verdict: 'maybe' }))).toBeNull()
+  })
+
+  it('rejects a nested markdown code fence with the JSON inside', () => {
+    const out = parseClassifierOutput('```json\n{"verdict":"block","reason":"r"}\n```')
+    expect(out).toEqual({ verdict: 'block', reason: 'r' })
+  })
+})
+
+describe('resolveVerdict — classifier output path', () => {
+  it('maps a block output to a block verdict with delegation', () => {
+    const verdict = resolveVerdict({
+      toolName: 'bash',
+      output: { verdict: 'block', reason: 'code work belongs to code-agent', delegateTo: 'code-agent' },
+      config: config(),
+    })
+    expect(verdict).toMatchObject({
+      verdict: 'block',
+      reason: 'code work belongs to code-agent',
+      delegateTo: 'code-agent',
+      reviewPrompt: null,
+      classifierFailed: false,
+      toolName: 'bash',
+    })
+  })
+
+  it('preserves reviewPrompt on a block verdict (plan-review category)', () => {
+    const verdict = resolveVerdict({
+      toolName: 'bash',
+      output: { verdict: 'block', delegateTo: null, reviewPrompt: 'review this plan' },
+      config: config(),
+    })
+    expect(verdict.verdict).toBe('block')
+    expect(verdict.reviewPrompt).toBe('review this plan')
+    expect(verdict.delegateTo).toBeNull()
+  })
+
+  it('coerces delegateTo to null on an allow verdict', () => {
+    const verdict = resolveVerdict({
+      toolName: 'bash',
+      output: { verdict: 'allow', delegateTo: 'code-agent' },
+      config: config(),
+    })
+    expect(verdict.verdict).toBe('allow')
+    expect(verdict.delegateTo).toBeNull()
+  })
+
+  it('defaults reason when the classifier omitted it', () => {
+    const verdict = resolveVerdict({
+      toolName: 'bash',
+      output: { verdict: 'block' },
+      config: config(),
+    })
+    expect(verdict.reason).toBe('classifier verdict: block')
+  })
+})
+
+describe('resolveVerdict — fallback path (classifier failed)', () => {
+  const failed = (toolName: string, cfg?: ResolvedGuardConfig): ReturnType<typeof resolveVerdict> =>
+    resolveVerdict({ toolName, output: null, config: cfg ?? config() })
+
+  it('code-class tools fail close regardless of the fallback setting', () => {
+    for (const fallback of ['close', 'open'] as const) {
+      const verdict = failed('bash', config({ fallback }))
+      expect(verdict.verdict).toBe('block')
+      expect(verdict.delegateTo).toBe('code-agent')
+      expect(verdict.classifierFailed).toBe(true)
+    }
+  })
+
+  it('diagnostic tools follow diagnosticFallback=open (allow)', () => {
+    const verdict = failed('read')
+    expect(verdict.verdict).toBe('allow')
+    expect(verdict.reason).toContain('diagnosticFallback=open')
+  })
+
+  it('diagnostic tools follow diagnosticFallback=close (block)', () => {
+    const verdict = failed('read', config({ diagnosticFallback: 'close' }))
+    expect(verdict.verdict).toBe('block')
+    expect(verdict.delegateTo).toBeNull()
+  })
+
+  it('other tools follow the close fallback with no delegation', () => {
+    const verdict = failed('mkdir')
+    expect(verdict.verdict).toBe('block')
+    expect(verdict.delegateTo).toBeNull()
+    expect(verdict.reason).toContain('fail-close')
+  })
+
+  it('other tools follow the open fallback', () => {
+    const verdict = failed('mkdir', config({ fallback: 'open' }))
+    expect(verdict.verdict).toBe('allow')
+    expect(verdict.delegateTo).toBeNull()
+  })
+
+  it('always attaches toolName and classifierFailed for traceability', () => {
+    const verdict = failed('bash')
+    expect(verdict.toolName).toBe('bash')
+    expect(verdict.classifierFailed).toBe(true)
+
+    const ok = resolveVerdict({
+      toolName: 'bash',
+      output: { verdict: 'allow' },
+      config: config(),
+    })
+    expect(ok.classifierFailed).toBe(false)
+    expect(ok.toolName).toBe('bash')
+  })
+})
