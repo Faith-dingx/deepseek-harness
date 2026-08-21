@@ -94,7 +94,11 @@ function agentFor(cwd: string, id = 'guard-agent'): { agent: Agent; injected: Us
   return { agent, injected, session }
 }
 
-async function setup(fetchImpl: () => Promise<Response> | undefined, track: { code?: number; check?: number } = {}): Promise<Context> {
+async function setup(
+  fetchImpl: () => Promise<Response> | undefined,
+  track: { code?: number; check?: number } = {},
+  timeoutMs = 2000,
+): Promise<Context> {
   vi.stubGlobal('fetch', fetchImpl ?? (async () => new Response('', { status: 200 })))
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
@@ -105,7 +109,7 @@ async function setup(fetchImpl: () => Promise<Response> | undefined, track: { co
     classifierModel: 'agnes/agnes-2.5-flash',
     fallback: 'close',
     diagnosticFallback: 'open',
-    timeoutMs: 2000,
+    timeoutMs,
     cacheTtlMs: 600000,
     cacheMax: 50,
     presetId: 'main-agent',
@@ -140,8 +144,9 @@ async function preExecute(
   agent: Agent | undefined,
   name: string,
   args: unknown,
+  signal?: AbortSignal,
 ): Promise<{ decision: PreToolDecision; nextCalls: number }> {
-  const signal = new AbortController().signal
+  const execSignal = signal ?? new AbortController().signal
   const exec = {
     token: Symbol('exec'),
     callId: CallId('integration-call'),
@@ -149,7 +154,7 @@ async function preExecute(
     name,
     arguments: args,
     ...agent !== undefined ? { agent } : {},
-    signal,
+    signal: execSignal,
   } as unknown as ToolExecution
   let nextCalls = 0
   const decision = await ctx.waterfall(
@@ -311,5 +316,102 @@ describe('guard-main-agent file policy integration (v2.1 whitelist + fail-close)
     const ctx = await setup(blockJson())
     const { decision } = await preExecute(ctx, undefined, 'write', { file_path: path.join(ws, '.temp/test.ts') })
     expect(decision.kind).toBe('deny')
+  })
+})
+
+describe('classifier timeout jitter regression (计划-guard误拦修复 T5)', () => {
+  /** Fetch stub that never settles on its own but rejects when its signal aborts. */
+  function abortAwareNever(): (input: string, init: RequestInit) => Promise<Response> {
+    return (_input, init) => new Promise<Response>((_, reject) => {
+      const abort = (): void => { reject(new DOMException('aborted', 'AbortError')) }
+      if (init.signal?.aborted) abort()
+      else init.signal?.addEventListener('abort', abort)
+    })
+  }
+
+  function allowJson(): () => Promise<Response> {
+    return async () => new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ verdict: 'allow' }) } }],
+    }), { status: 200 })
+  }
+
+  it('场景E: a >5s jitter (timeout on attempt 1) is retried and allowed instead of mis-blocked', async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(abortAwareNever()) // first attempt hangs until the 6s timeout aborts it
+      .mockImplementationOnce(allowJson()) // retry returns promptly
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(fetchMock, track, 6000)
+    const { agent } = agentFor(ws)
+    vi.useFakeTimers()
+    try {
+      const pending = preExecute(ctx, agent, 'bash', { command: 'pwd' })
+      // Advance past the per-attempt timeout: attempt 1 aborts, retry succeeds.
+      vi.advanceTimersByTime(6000)
+      const { decision } = await pending
+      expect(decision.kind).toBe('allow')
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(track.code).toBeUndefined() // allowed -> no delegation
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('场景F: a real failure (network error) still fails close, no delegation of intent', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error('network down'))
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(fetchMock, track)
+    const { agent } = agentFor(ws)
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
+    expect(decision.kind).toBe('deny')
+    expect(fetchMock).toHaveBeenCalledTimes(1) // fatal -> no retry
+    expect(track.code).toBe(1) // fail-close delegates to code-agent
+  })
+
+  it('场景G: HTTP 500 fails close without retry', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('boom', { status: 500 }))
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(fetchMock, track)
+    const { agent } = agentFor(ws)
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
+    expect(decision.kind).toBe('deny')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(track.code).toBe(1)
+  })
+
+  it('场景G+: HTTP 429 fails close without retry', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('too many requests', { status: 429 }))
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(fetchMock, track)
+    const { agent } = agentFor(ws)
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
+    expect(decision.kind).toBe('deny')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(track.code).toBe(1)
+  })
+
+  it('场景G+: HTTP 400 fails close without retry', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('bad request', { status: 400 }))
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(fetchMock, track)
+    const { agent } = agentFor(ws)
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
+    expect(decision.kind).toBe('deny')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(track.code).toBe(1)
+  })
+
+  it('场景H: a caller abort is a hard stop -> fetch never called, bash fails close', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const fetchMock = vi.fn()
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(fetchMock, track)
+    const { agent } = agentFor(ws)
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' }, controller.signal)
+    expect(fetchMock).toHaveBeenCalledTimes(0) // abort detected at the classify() entry
+    expect(decision.kind).toBe('deny') // caller abort is fatal -> fail-close
+    // The caller cancelled the turn, so the delegation channel is cancelled too
+    // (tools.execute refuses an already-aborted signal): no subagent dispatch.
+    expect(track.code).toBeUndefined()
   })
 })

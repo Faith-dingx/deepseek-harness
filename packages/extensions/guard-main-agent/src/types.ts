@@ -8,6 +8,13 @@
 export type FallbackMode = 'close' | 'open'
 
 /**
+ * Why a classification attempt failed, if it did.
+ * - `timeout` -> the classifier request timed out (transient jitter; retried)
+ * - `fatal`  -> caller abort, network/HTTP errors, unreadable output (no retry)
+ */
+export type ClassifyErrorType = 'timeout' | 'fatal'
+
+/**
  * Final per-call decision of the guard. `block` denies the tool call
  * (fail-close default), `allow` passes it through.
  */
@@ -35,6 +42,11 @@ export interface PolicyVerdict {
   readonly classifierFailed: boolean
   /** Tool that was evaluated. */
   readonly toolName: string
+  /**
+   * Classification failure cause when the classifier failed (`timeout` =
+   * transient, retried; `fatal` = real failure). Absent on success/cache hits.
+   */
+  readonly errorType?: ClassifyErrorType
 }
 
 /** Raw classifier output, matching the prompt contract in prompt.ts. */
@@ -57,6 +69,11 @@ export interface GuardPluginConfig {
   diagnosticFallback?: FallbackMode
   /** Classifier request timeout, milliseconds. */
   timeoutMs?: number
+  /**
+   * Retry count for transient classifier timeouts (default `1`). HTTP
+   * errors, network failures, caller aborts and unreadable output never retry.
+   */
+  retryCount?: number
   /** Cache TTL, milliseconds. */
   cacheTtlMs?: number
   /** LRU cache cap. */
@@ -76,6 +93,8 @@ export interface ResolvedGuardConfig {
   readonly fallback: FallbackMode
   readonly diagnosticFallback: FallbackMode
   readonly timeoutMs: number
+  /** Retry count for transient classifier timeouts (resolved default `1`). */
+  readonly retryCount: number
   readonly cacheTtlMs: number
   readonly cacheMax: number
   readonly presetId: string

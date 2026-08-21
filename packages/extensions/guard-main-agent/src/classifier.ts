@@ -12,33 +12,68 @@
  * @module @deepseek-ai/dsh-guard-main-agent
  */
 
-import type { ClassifierContext, ClassifierOutput, ResolvedGuardConfig } from './types.ts'
+import type { ClassifyErrorType, ClassifierContext, ClassifierOutput, ResolvedGuardConfig } from './types.ts'
 import { buildSystemPrompt, buildUserMessage } from './prompt.ts'
 import { parseClassifierOutput } from './policy.ts'
 
-/** A successful parse or a contained failure. */
+/** A successful parse or a contained failure (with its failure class). */
 export type ClassifyResult =
   | { readonly ok: true; readonly output: ClassifierOutput }
-  | { readonly ok: false; readonly error: string }
+  | { readonly ok: false; readonly error: string; readonly errorType: ClassifyErrorType }
 
 /**
  * High-level classification entry point: call the classifier, parse the reply,
  * and fold any failure into `{ok:false}`. Never throws.
+ *
+ * Failure contract (plan 计划-guard误拦修复 v2 决策 2):
+ * - transient timeout           -> retried `config.retryCount` times (default 1)
+ * - caller abort (hard stop)    -> returned immediately, never retried
+ * - HTTP/network/unreadable     -> `fatal`, never retried (fail-close below)
  */
 export async function classify(
-  config: Pick<ResolvedGuardConfig, 'classifierEndpoint' | 'classifierModel' | 'timeoutMs'>,
+  config: Pick<ResolvedGuardConfig, 'classifierEndpoint' | 'classifierModel' | 'timeoutMs' | 'retryCount'>,
   context: ClassifierContext,
   signal?: AbortSignal,
 ): Promise<ClassifyResult> {
-  try {
-    const raw = await callClassifier(config, context, signal)
-    const output = parseClassifierOutput(raw)
-    return output !== null
-      ? { ok: true, output }
-      : { ok: false, error: 'classifier output unreadable' }
-  } catch (error) {
-    return { ok: false, error: errorMessage(error) }
+  // Caller aborted before we even start: hard stop, no fetch, no retry.
+  if (signal?.aborted) return { ok: false, error: 'caller aborted', errorType: 'fatal' }
+  const maxAttempts = 1 + config.retryCount
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    // The caller may abort between retries; respect it before any new fetch.
+    if (signal?.aborted) return { ok: false, error: 'caller aborted', errorType: 'fatal' }
+    try {
+      const raw = await callClassifier(config, context, signal)
+      const output = parseClassifierOutput(raw)
+      // Unreadable output is a real model anomaly: fail-close, never retry.
+      return output !== null
+        ? { ok: true, output }
+        : { ok: false, error: 'classifier output unreadable', errorType: 'fatal' }
+    } catch (error) {
+      // Caller aborted mid-flight: hard stop, never retry against their intent.
+      if (signal?.aborted) return { ok: false, error: 'caller aborted', errorType: 'fatal' }
+      const timeout = isTimeoutError(error)
+      // Only a timeout (transient jitter) is retried; 4xx/5xx/network are fatal.
+      if (timeout && attempt < maxAttempts - 1) continue
+      return { ok: false, error: errorMessage(error), errorType: timeout ? 'timeout' : 'fatal' }
+    }
   }
+  // Unreachable in practice (the loop always returns); kept for type exhaustiveness.
+  return { ok: false, error: 'classifier failed', errorType: 'fatal' }
+}
+
+/**
+ * Whether a thrown value represents a timeout worth retrying. The internal
+ * AbortController (config.timeoutMs) surfaces as `DOMException` with name
+ * `AbortError`; some runtimes instead throw a plain Error whose message
+ * mentions the abort/timed-out condition (plan R5).
+ */
+export function isTimeoutError(error: unknown): boolean {
+  if (error instanceof DOMException) return error.name === 'AbortError'
+  if (error instanceof Error) {
+    const message = error.message.toLocaleLowerCase()
+    return message.includes('abort') || message.includes('timed out')
+  }
+  return false
 }
 
 /** The raw HTTP client primitive. Kept separate for isolated unit testing. */

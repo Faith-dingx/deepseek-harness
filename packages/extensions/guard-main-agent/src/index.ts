@@ -29,7 +29,7 @@ import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
-import type { ClassifierOutput, GuardPluginConfig, PolicyVerdict, ResolvedGuardConfig } from './types.ts'
+import type { ClassifyErrorType, ClassifierOutput, GuardPluginConfig, PolicyVerdict, ResolvedGuardConfig } from './types.ts'
 import { classify, summarizeArgs } from './classifier.ts'
 import { DELEGATION_TOOLS, DIAGNOSTIC_TOOLS, WRITE_TOOLS, resolveVerdict } from './policy.ts'
 import { createFilePolicy, parsePolicy, type FileDecision, type FilePolicy } from './filePolicy.ts'
@@ -42,7 +42,8 @@ export const inject = ['agents', 'tools']
 
 const DEFAULT_ENDPOINT = 'http://10.10.10.2:9888/v1/chat/completions'
 const DEFAULT_MODEL = 'agnes/agnes-2.5-flash'
-const DEFAULT_TIMEOUT_MS = 5000
+const DEFAULT_TIMEOUT_MS = 10000
+const DEFAULT_RETRY_COUNT = 1
 const DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000
 const DEFAULT_CACHE_MAX = 50
 
@@ -53,6 +54,7 @@ export interface Config {
   fallback?: 'close' | 'open'
   diagnosticFallback?: 'close' | 'open'
   timeoutMs?: number
+  retryCount?: number
   cacheTtlMs?: number
   cacheMax?: number
   presetId?: string
@@ -66,6 +68,7 @@ export const Config: z<Config> = z.object({
   fallback: z.union(['close', 'open'] as const).default('close'),
   diagnosticFallback: z.union(['close', 'open'] as const).default('open'),
   timeoutMs: z.number().default(DEFAULT_TIMEOUT_MS),
+  retryCount: z.number().default(DEFAULT_RETRY_COUNT),
   cacheTtlMs: z.number().default(DEFAULT_CACHE_TTL_MS),
   cacheMax: z.number().default(DEFAULT_CACHE_MAX),
   presetId: z.string().default('main-agent'),
@@ -82,6 +85,7 @@ export function resolveConfig(raw: GuardPluginConfig): ResolvedGuardConfig {
     fallback: raw.fallback ?? 'close',
     diagnosticFallback: raw.diagnosticFallback ?? 'open',
     timeoutMs: raw.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    retryCount: raw.retryCount ?? DEFAULT_RETRY_COUNT,
     cacheTtlMs: raw.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS,
     cacheMax: raw.cacheMax ?? DEFAULT_CACHE_MAX,
     presetId: raw.presetId ?? 'main-agent',
@@ -180,11 +184,15 @@ async function classifyAndDecide(
   // changes the hash and forces reclassification (plan decision 4).
   let output: ClassifierOutput | null = null
   let cacheHit = false
+  let failureType: ClassifyErrorType | undefined
   const cached = cache.get(key)
   if (cached !== undefined) {
     output = cached
     cacheHit = true
   } else {
+    // Per-call classifier duration (plan S2): feeds the P95/P99 observation
+    // of the 9888 route on top of the overall decision `ms` already logged.
+    const classifierStart = performance.now()
     const result = await classify(resolved, {
       sessionId: agent !== undefined ? String(agent.id) : 'unknown',
       workspacePath: cwd,
@@ -194,16 +202,21 @@ async function classifyAndDecide(
       conversation: texts.conversationText,
       userMessage: texts.lastUserText.length > 0 ? texts.lastUserText : '(no message text)',
     }, exec.signal)
+    const classifierDurationMs = Math.round(performance.now() - classifierStart)
     if (result.ok) {
       output = result.output
       cache.set(key, output)
+      ctx.logger.info(`[guard-main-agent] classifier ok tool=${toolName} duration_ms=${classifierDurationMs}`)
     } else {
-      ctx.logger.warn(`[guard-main-agent] classifier failed: ${result.error}`)
+      failureType = result.errorType
+      ctx.logger.warn(
+        `[guard-main-agent] classifier failed errorType=${result.errorType} duration_ms=${classifierDurationMs} error=${result.error}`,
+      )
     }
   }
 
   const verdict = resolveVerdict({ toolName, output, config: resolved })
-  logDecision(ctx, decisionRecord(toolName, verdict.verdict, verdict.reason, verdict.delegateTo), started, cacheHit ? 'classifier-cache-hit' : 'classifier-decision')
+  logDecision(ctx, decisionRecord(toolName, verdict.verdict, verdict.reason, verdict.delegateTo, failureType), started, cacheHit ? 'classifier-cache-hit' : 'classifier-decision')
   if (verdict.verdict === 'block') return blockAndDeny(ctx, exec, verdict)
   return next()
 }
@@ -269,20 +282,23 @@ function decisionRecord(
   verdict: PolicyVerdict['verdict'],
   reason: string,
   delegateTo: PolicyVerdict['delegateTo'],
+  errorType?: ClassifyErrorType,
 ): Omit<PolicyVerdict, 'reviewPrompt' | 'classifierFailed'> {
-  return { toolName, verdict, reason, delegateTo }
+  return errorType === undefined
+    ? { toolName, verdict, reason, delegateTo }
+    : { toolName, verdict, reason, delegateTo, errorType }
 }
 
 /** Structured, traceable decision log (acceptance criterion 6). */
 function logDecision(
   ctx: Context,
-  verdict: { toolName: string; verdict: string; reason: string; delegateTo: string | null },
+  verdict: { toolName: string; verdict: string; reason: string; delegateTo: string | null; errorType?: ClassifyErrorType },
   started: number,
   source: string,
 ): void {
   ctx.logger.info(
     `[guard-main-agent] decision source=${source} tool=${verdict.toolName} verdict=${verdict.verdict} ` +
-      `reason="${verdict.reason}" delegateTo=${verdict.delegateTo ?? 'null'} ms=${Date.now() - started}`,
+      `reason="${verdict.reason}" delegateTo=${verdict.delegateTo ?? 'null'} errorType=${verdict.errorType ?? 'none'} ms=${Date.now() - started}`,
   )
 }
 

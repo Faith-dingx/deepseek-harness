@@ -9,6 +9,7 @@ const config: ResolvedGuardConfig = {
   fallback: 'close',
   diagnosticFallback: 'open',
   timeoutMs: 5000,
+  retryCount: 1,
   cacheTtlMs: 600000,
   cacheMax: 50,
   presetId: 'main-agent',
@@ -175,5 +176,59 @@ describe('callClassifier', () => {
       () => 'rejected',
     )
     expect(await p).toBe('rejected')
+  })
+})
+
+describe('classify retry (计划-guard误拦修复 T4)', () => {
+  it('场景A: a timeout error is retried once and succeeds', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new DOMException('aborted', 'AbortError'))
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ choices: [{ message: { content: JSON.stringify({ verdict: 'allow' }) } }] }),
+        { status: 200 },
+      ))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await classify(config, context)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.output).toEqual({ verdict: 'allow' })
+  })
+
+  it('场景B: a timeout error retried once still fails -> errorType timeout', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new DOMException('aborted', 'AbortError'))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await classify(config, context)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.errorType).toBe('timeout')
+  })
+
+  it('场景C: a non-timeout error is NOT retried -> errorType fatal', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error('network down'))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await classify(config, context)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.errorType).toBe('fatal')
+  })
+
+  it('场景D: retryCount=0 disables the timeout retry', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new DOMException('aborted', 'AbortError'))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await classify({ ...config, retryCount: 0 }, context)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.errorType).toBe('timeout')
+  })
+
+  it('场景E: caller abort is a hard stop -> fetch never called, no retry', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const fetchMock = vi.fn(abortAwareNever())
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await classify(config, context, controller.signal)
+    expect(fetchMock).toHaveBeenCalledTimes(0)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.errorType).toBe('fatal')
   })
 })

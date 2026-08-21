@@ -37,7 +37,8 @@ The plugin registers a `tools/pre-execute` listener (documented API, `packages/c
     classifierModel: 'agnes/agnes-2.5-flash'                            # 注意厂商前缀
     fallback: 'close'           # 分类失败时的策略：close（默认，防越界优先）| open
     diagnosticFallback: 'open'  # 诊断/只读类失败时的策略（默认 open）
-    timeoutMs: 5000             # 单次分类超时
+    timeoutMs: 10000            # 单次分类超时（默认 10000；下限经验 1000）
+    retryCount: 1               # 超时重试次数（默认 1；仅瞬时超时触发，HTTP/网络错误不重试）
     cacheTtlMs: 600000          # 任务类型缓存 10 分钟
     cacheMax: 50                # LRU 上限
     presetId: 'main-agent'      # 缓存键中的 preset 字段
@@ -63,7 +64,8 @@ The plugin registers a `tools/pre-execute` listener (documented API, `packages/c
 
 | 情形 | 行为 |
 |---|---|
-| 分类器超时/网络失败/输出不可解析 | 代码类工具（bash/terminal/tool-cordis）→ **强制 close**；诊断/只读 → `diagnosticFallback`（默认 open）→ 放行；其余工具 → `fallback`（默认 close） |
+| 分类器瞬时超时（AbortError） | **重试 `retryCount` 次（默认 1）**，仍失败才按下行降级；日志 `errorType=timeout` |
+| 分类器真故障（HTTP 4xx/5xx/网络/输出不可解析/caller abort） | **不重试**；代码类工具（bash/terminal/tool-cordis）→ **强制 close**；诊断/只读 → `diagnosticFallback`（默认 open）→ 放行；其余工具 → `fallback`（默认 close）；日志 `errorType=fatal` |
 | 文件清单加载失败 | **deny-all**（fail-close），记录 warning |
 | 子代理派发失败（call_code_agent 不可用） | 记录 warning，deny 依然生效（不因此放行） |
 | 无法从实参提取写路径 | 记录 warning，放行交给工具自身报错 |

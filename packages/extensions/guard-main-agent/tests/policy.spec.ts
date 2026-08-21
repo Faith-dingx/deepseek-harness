@@ -16,6 +16,7 @@ const config = (options: { fallback?: FallbackMode; diagnosticFallback?: Fallbac
   fallback: options.fallback ?? 'close',
   diagnosticFallback: options.diagnosticFallback ?? 'open',
   timeoutMs: 5000,
+  retryCount: 1,
   cacheTtlMs: 600000,
   cacheMax: 50,
   presetId: 'main-agent',
