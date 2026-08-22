@@ -233,3 +233,60 @@ describe('classify timeout abort (计划 v18 §4.2.2 超时 fail-open)', () => {
     expect(results[0]?.category).toBe('useful')
   })
 })
+
+describe('classifySegments batch cap + segment truncation (9888 网关大窗口防护)', () => {
+  function requestPrompt(fetchMock: ReturnType<typeof vi.fn>): string {
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    const body = JSON.parse(typeof init?.body === 'string' ? init.body : '') as { messages: { role: string; content: string }[] }
+    return body.messages[1]?.content ?? ''
+  }
+
+  it('sends only the newest classifyMaxBatch pending segments when over the cap (mock fetch 1 次, 请求体段数=上限)', async () => {
+    const fetchMock = vi.fn(replyJson([
+      { segmentId: 'p6', category: 'useful', confidence: 0.9 },
+      { segmentId: 'p7', category: 'useful', confidence: 0.9 },
+      { segmentId: 'p8', category: 'useful', confidence: 0.9 },
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    const segments = Array.from({ length: 8 }, (_, i) => segment(`p${i + 1}`, `待分类内容 ${i + 1}`))
+    const results = await classifySegments(segments, 'ctx', { ...config, classifyMaxBatch: 3 })
+
+    // 一次批量调用, 请求体段数 = 上限
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const prompt = requestPrompt(fetchMock)
+    expect(prompt.match(/\[p\d+\]/g) ?? []).toHaveLength(3)
+    expect(prompt).toContain('[p6]')
+    expect(prompt).toContain('[p8]')
+    expect(prompt).not.toContain('[p1]')
+    expect(prompt).not.toContain('[p5]')
+
+    // 被裁掉的旧段直接走 useful fallback-keep (原始历史完整保留, 只影响 LLM 可见范围)
+    for (const id of ['p1', 'p2', 'p3', 'p4', 'p5']) {
+      const r = results.find(res => res.segmentId === id)
+      expect(r?.category).toBe('useful')
+      expect(r?.reasoning).toBe('fallback-keep')
+    }
+    // 发送段仍走 LLM 判定
+    expect(results.find(res => res.segmentId === 'p6')?.category).toBe('useful')
+    expect(results).toHaveLength(8)
+  })
+
+  it('truncates segment content to llmSegmentChars before sending (>上限 内容被裁, 原始 content 不改)', async () => {
+    const fetchMock = vi.fn(replyJson([{ segmentId: 'p1', category: 'useful', confidence: 0.9 }]))
+    vi.stubGlobal('fetch', fetchMock)
+    const long = '字'.repeat(500)
+    await classifySegments([segment('p1', long)], 'ctx', { ...config, llmSegmentChars: 100 })
+    const prompt = requestPrompt(fetchMock)
+    expect(prompt).toContain(`${'字'.repeat(100)}…`)
+    expect(prompt).not.toContain('字'.repeat(101))
+  })
+
+  it('leaves short content untruncated when under the segment char cap', async () => {
+    const fetchMock = vi.fn(replyJson([{ segmentId: 'p1', category: 'useful', confidence: 0.9 }]))
+    vi.stubGlobal('fetch', fetchMock)
+    await classifySegments([segment('p1', '短内容')], 'ctx', { ...config, llmSegmentChars: 100 })
+    const prompt = requestPrompt(fetchMock)
+    expect(prompt).toContain('[p1] 短内容')
+    expect(prompt).not.toContain('…')
+  })
+})

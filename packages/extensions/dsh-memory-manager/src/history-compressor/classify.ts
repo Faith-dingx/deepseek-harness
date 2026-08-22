@@ -14,6 +14,8 @@
  * @module dsh-memory-manager/history-compressor/classify
  */
 
+import { DEFAULT_CLASSIFY_TIMEOUT_MS } from '../config'
+
 /** The four history categories (计划 v18 §4.2.2). */
 export type HistoryCategory = 'stale' | 'useless' | 'useful' | 'valuable-but-not-current'
 
@@ -41,6 +43,10 @@ export interface ClassifyConfig {
   readonly model: string
   readonly confidenceThreshold: number
   readonly timeoutMs?: number
+  /** Max pending segments sent to the LLM in one batch (newest win). */
+  readonly classifyMaxBatch?: number
+  /** Per-segment char cap for the LLM payload (truncated with an ellipsis). */
+  readonly llmSegmentChars?: number
 }
 
 /** A rule-verdict or null (no rule matched → ask the LLM). */
@@ -138,7 +144,7 @@ async function callClassifier(
   fetchImpl: typeof fetch,
 ): Promise<ParsedClassification | null> {
   const controller = new AbortController()
-  const timeout = setTimeout(() => { controller.abort() }, config.timeoutMs ?? 10000)
+  const timeout = setTimeout(() => { controller.abort() }, config.timeoutMs ?? DEFAULT_CLASSIFY_TIMEOUT_MS)
   try {
     const body = {
       model: config.model,
@@ -149,7 +155,8 @@ async function callClassifier(
         },
         {
           role: 'user',
-          content: `当前任务上下文：\n${currentTaskContext}\n\n历史片段：\n${segments.map(s => `[${s.turnId}] ${s.content}`).join('\n')}`,
+          // 大窗口防护: 每段截断到 llmSegmentChars, 控制 9888 网关 payload 延迟
+          content: `当前任务上下文：\n${currentTaskContext}\n\n历史片段：\n${segments.map(s => `[${s.turnId}] ${renderForLLM(s.content, config.llmSegmentChars ?? Number.POSITIVE_INFINITY)}`).join('\n')}`,
         },
       ],
       temperature: 0,
@@ -173,10 +180,21 @@ async function callClassifier(
   }
 }
 
+/** Truncate a segment's content for the LLM payload (原始 content 不改). */
+function renderForLLM(content: string, maxChars: number): string {
+  return content.length > maxChars ? `${content.slice(0, maxChars)}…` : content
+}
+
 /**
  * Classify every segment, keeping input order. Rules win where applicable;
  * the LLM fills the rest; anything uncertain degrades to `useful`
  * (fail-open, 保留原文).
+ *
+ * Batch cap: when more than `classifyMaxBatch` segments reach the LLM, only
+ * the NEWEST `classifyMaxBatch` (segments are time-ascending → slice(-N)) are
+ * sent; the trimmed old segments go straight to the useful fallback. 取舍:
+ * the raw history is preserved verbatim regardless — trimming only limits the
+ * LLM-visible window (9888 gateway latency grows with payload).
  */
 export async function classifySegments(
   segments: readonly HistorySegment[],
@@ -203,8 +221,17 @@ export async function classifySegments(
   }
 
   if (pending.length > 0) {
-    const llm = await callClassifier(pending, currentTaskContext, config, fetchImpl)
-    for (const segment of pending) {
+    const maxBatch = config.classifyMaxBatch ?? Number.POSITIVE_INFINITY
+    const keep = Math.min(pending.length, Math.max(0, maxBatch))
+    const overCap = keep < pending.length
+    const trimmed = overCap ? pending.slice(0, pending.length - keep) : []
+    const llmBatch = overCap ? pending.slice(pending.length - keep) : pending
+    // 被裁掉的最旧段: 直接走兜底 (保留原文, 不浪费一次 LLM 调用)
+    for (const segment of trimmed) {
+      byId.set(segment.turnId, { segmentId: segment.turnId, category: 'useful', confidence: 0.5, reasoning: 'fallback-keep' })
+    }
+    const llm = await callClassifier(llmBatch, currentTaskContext, config, fetchImpl)
+    for (const segment of llmBatch) {
       const verdict = llm?.get(segment.turnId)
       // usable countermands the `verdict !== undefined` re-check: narrow by
       // inlining the undefined test instead of re-testing after `usable`.

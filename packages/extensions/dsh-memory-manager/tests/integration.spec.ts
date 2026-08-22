@@ -3,8 +3,8 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { Context } from '@deepseek-ai/cordis'
-import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
-import { apply, currentTaskContextOf, handlePoll, handleTurnEnd, runAuditOnce, runCompression, segmentsFromEvents, type CompressFs } from '../src/index.ts'
+import { SessionId, type Session, type SessionEvent, type SessionStore } from '@deepseek-ai/dsh-session'
+import { apply, createRealFs, currentTaskContextOf, handlePoll, handleTurnEnd, pollSessions, runAuditOnce, runCompression, segmentsFromEvents, sessionWorkspaces, type CompressFs } from '../src/index.ts'
 import { MtimeWatcher, scanShortTermFiles } from '../src/audit-pipeline/watcher.ts'
 import { TurnTrigger } from '../src/history-compressor/trigger.ts'
 import { PendingWriteRegistry } from '../src/audit-pipeline/confirm.ts'
@@ -219,8 +219,10 @@ describe('runCompression 端到端 (T16: 先甄别归档→后摘要→再审核
     const outcome = await runCompression({ id: SessionId('s'), events: tenTurnEvents() }, 10, paths, config, {
       fetchImpl,
       userMemoryTarget: `${home}/.dsh/memory/MEMORY.md`,
+      // registerPendingWrite 是 CompressionDeps 必填字段（src 无 fallback）; noop 保持"未注入注册"语义
+      registerPendingWrite: () => {},
     })
-    // 无注入的 fs/register: 归档与摘要写失败 → fail-open 静默降级, 分类结果仍可用
+    // 无注入的 fs: 归档与摘要写失败 → fail-open 静默降级, 分类结果仍可用
     expect(outcome.range).toEqual({ from: 3, to: 8 })
     expect(outcome.summaryOk).toBe(false)
     expect(outcome.classified.length).toBeGreaterThan(0)
@@ -251,6 +253,67 @@ describe('runCompression 端到端 (T16: 先甄别归档→后摘要→再审核
     })
     expect(outcome.range).toBeNull()
     expect(outcome.classified).toEqual([])
+  })
+
+  it('flows the config batch caps and segment truncation into the LLM requests (大窗口防护)', async () => {
+    await clearWs()
+    // 64 轮 → 压缩窗口 3..62 = 120 段, 全部 pending → classifyMaxBatch=60 只发最新 60 段
+    const events: SessionEvent[] = []
+    for (let turn = 1; turn <= 64; turn += 1) {
+      events.push(turnStart(turn))
+      events.push(userMsg(turn, `请求 ${turn} 的细节`.repeat(80)))
+      events.push(assistantMsg(turn, `回复 ${turn} 的细节`.repeat(80)))
+      events.push(event('turn/end', { turn }))
+    }
+    const bodies: string[] = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      bodies.push(typeof init?.body === 'string' ? init.body : '')
+      return new Response(JSON.stringify({ choices: [{ message: { content: '# 对话历史摘要\n## Primary Request\n- ok\n## Key Concepts\n- k\n## Files\n- f\n## Errors\n- e\n## Pending Jobs\n- j\n' } }] }), { status: 200 })
+    }
+    const outcome = await runCompression({ id: SessionId('cap-session'), events }, 64, paths, config, {
+      fsImpl: realFs,
+      fetchImpl,
+      userMemoryTarget: `${home}/.dsh/memory/MEMORY.md`,
+      registerPendingWrite: () => {},
+    })
+    expect(outcome.classified).toHaveLength(120)
+    expect(outcome.summaryOk).toBe(true)
+    expect(bodies).toHaveLength(2)
+    // classify 请求: 只含最新 60 段 + 截断标记
+    const classBody = JSON.parse(bodies[0] as string) as { messages: { role: string; content: string }[] }
+    const classPrompt = classBody.messages[1]?.content ?? ''
+    expect(classPrompt.match(/\[[ua]\d+\]/g) ?? []).toHaveLength(60)
+    expect(classPrompt).toContain('[u62]')
+    expect(classPrompt).toContain('[a33]')
+    expect(classPrompt).not.toContain('[u3]')
+    expect(classPrompt).not.toContain('[a32]')
+    expect(classPrompt).toContain('…')
+    // summarize 请求: 全部仍有用 → summarizeMaxSegments=30 只发最新 30 段 + 截断
+    const sumBody = JSON.parse(bodies[1] as string) as { messages: { role: string; content: string }[] }
+    const sumPrompt = sumBody.messages[1]?.content ?? ''
+    expect(sumPrompt.match(/\[[ua]\d+\]/g) ?? []).toHaveLength(30)
+    expect(sumPrompt).toContain('[u62]')
+    expect(sumPrompt).not.toContain('[u33]')
+    expect(sumPrompt).toContain('…')
+  })
+
+  it('honors the configured LLM timeouts end-to-end (30ms → abort fast, fail-open)', async () => {
+    await clearWs()
+    const neverSettle = (_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => { reject(new Error('Aborted')) })
+    })
+    const fast = resolveConfig({ pollIntervalMs: 60000, classifyTimeoutMs: 30, summaryTimeoutMs: 30 })
+    const started = Date.now()
+    const outcome = await runCompression({ id: SessionId('timeout-session'), events: tenTurnEvents() }, 10, paths, fast, {
+      fsImpl: realFs,
+      fetchImpl: neverSettle,
+      userMemoryTarget: `${home}/.dsh/memory/MEMORY.md`,
+      registerPendingWrite: () => {},
+    })
+    // 硬编码 10s 会被 vitest 5s 上限打死; 配置 30ms 必须秒级完成
+    expect(Date.now() - started).toBeLessThan(5000)
+    expect(outcome.classified.every(c => c.category === 'useful')).toBe(true)
+    expect(outcome.summaryOk).toBe(true)
   })
 })
 
@@ -356,13 +419,73 @@ describe('runAuditOnce 六步管线集成 (T16)', () => {
   })
 })
 
+describe('sessionWorkspaces / pollSessions (修复B: poll 靶标 = 活动会话 cwd)', () => {
+  it('sessionWorkspaces 收集去重后的非空 cwd (跳过无 cwd / 空 cwd)', () => {
+    expect(sessionWorkspaces([
+      { header: { cwd: '/a' } },
+      { header: { cwd: '/a' } },
+      { header: {} },
+      { header: { cwd: '' } },
+      { header: { cwd: '/b' } },
+    ])).toEqual(['/a', '/b'])
+    expect(sessionWorkspaces([])).toEqual([])
+    expect(sessionWorkspaces([{ header: {} }])).toEqual([])
+  })
+
+  it('pollSessions 无活动会话 → 不审核, 返回空', async () => {
+    const watcher = new MtimeWatcher()
+    const registry = new PendingWriteRegistry()
+    const cwds = await pollSessions({ watcher, registry, resolved: config, home }, [])
+    expect(cwds).toEqual([])
+  })
+
+  it('pollSessions 每个活动会话的 cwd 各跑一次审核 (distinct 去重)', async () => {
+    const watcher = new MtimeWatcher()
+    const registry = new PendingWriteRegistry()
+    const cwds = await pollSessions({ watcher, registry, resolved: config, home }, [
+      { header: { cwd: ws } },
+      { header: { cwd: ws } },
+      { header: {} },
+    ])
+    expect(cwds).toEqual([ws])
+  })
+
+  it('createRealFs 真实读写/建目录/stat/readdir (生产 fs 接线)', async () => {
+    await fs.rm(ws, { recursive: true, force: true })
+    await fs.mkdir(ws, { recursive: true })
+    const real = createRealFs()
+    await real.mkdir(`${ws}/.dsh-memory`, { recursive: true })
+    await real.writeFile(paths.summaryFile, 'hello')
+    expect(await real.readFile(paths.summaryFile)).toBe('hello')
+    expect((await real.stat(paths.summaryFile)).size).toBe(5)
+    expect(await real.readdir(`${ws}/.dsh-memory`)).toContain('conversationsummary-latest.md')
+  })
+
+  it('handlePoll 发现变更时打审核观测日志 (全链路日志 #2)', async () => {
+    await fs.rm(ws, { recursive: true, force: true })
+    await fs.mkdir(`${ws}/.dsh-memory/reflections`, { recursive: true })
+    await fs.mkdir(`${ws}/.dsh-memory/archive/history`, { recursive: true })
+    const watcher = new MtimeWatcher()
+    const registry = new PendingWriteRegistry()
+    registry.register(paths.summaryFile, 'history-compressor')
+    await fs.writeFile(paths.summaryFile, 'x', 'utf8')
+    await handlePoll({ watcher, registry, resolved: config, home, fsImpl: realFs }, ws) // 种子基线
+    await new Promise((r) => { setTimeout(r, 1100) })
+    await fs.writeFile(paths.summaryFile, 'y', 'utf8')
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    await handlePoll({ watcher, registry, resolved: config, home, fsImpl: realFs }, ws)
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('[dsh-memory-manager] poll audit'))
+    info.mockRestore()
+  })
+})
+
 describe('handleTurnEnd / handlePoll (T16 事件入口, 可测试编排)', () => {
   it('ignores non turn/end events and routes turn/end into the compressor', async () => {
     await fs.rm(ws, { recursive: true, force: true })
     await fs.mkdir(ws, { recursive: true })
     const events = tenTurnEvents()
     events[3] = userMsg(2, '好的，谢谢！')
-    const session = { id: SessionId('h1'), header: { cwd: ws }, events }
+    const session = { id: SessionId('h1'), header: { cwd: ws }, events } as unknown as Session
     const watcher = new MtimeWatcher()
     const registry = new PendingWriteRegistry()
     const trigger = new TurnTrigger({ thresholdTurns: 8 })
@@ -390,7 +513,7 @@ describe('handleTurnEnd / handlePoll (T16 事件入口, 可测试编排)', () =>
     await fs.mkdir(ws, { recursive: true })
     const events = tenTurnEvents()
     events[3] = userMsg(2, '好的，谢谢！')
-    const session = { id: SessionId('h1'), header: {}, events } // header 无 cwd
+    const session = { id: SessionId('h1'), header: {}, events } as unknown as Session // header 无 cwd
     const watcher = new MtimeWatcher()
     const registry = new PendingWriteRegistry()
     const trigger = new TurnTrigger({ thresholdTurns: 8 })
@@ -400,6 +523,50 @@ describe('handleTurnEnd / handlePoll (T16 事件入口, 可测试编排)', () =>
     await new Promise((r) => { setTimeout(r, 80) })
     // 压缩确实被触发（回退 cwd 路径解析成功）
     expect(stalled).toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('turn/end 压缩成功时打观测日志 (全链路日志 #1, 真实 fs 写摘要)', async () => {
+    await fs.rm(ws, { recursive: true, force: true })
+    await fs.mkdir(ws, { recursive: true })
+    const events = tenTurnEvents()
+    events[3] = userMsg(2, '好的，谢谢！')
+    const session = { id: SessionId('h-log'), header: { cwd: ws }, events } as unknown as Session
+    const watcher = new MtimeWatcher()
+    const registry = new PendingWriteRegistry()
+    const trigger = new TurnTrigger({ thresholdTurns: 8 })
+    let call = 0
+    const fetchImpl: typeof fetch = async () => {
+      call += 1
+      if (call === 1) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify([{ segmentId: 'u4', category: 'useless', confidence: 0.95 }]) } }] }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: '# 对话历史摘要\n## Primary Request\n- x\n## Key Concepts\n- k\n## Files\n- f\n## Errors\n- e\n## Pending Jobs\n- j\n' } }] }), { status: 200 })
+    }
+    vi.stubGlobal('fetch', fetchImpl)
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    await handleTurnEnd({ watcher, registry, trigger, resolved: config, home, fsImpl: realFs }, session, event('turn/end', { turn: 10 }))
+    await new Promise((r) => { setTimeout(r, 120) })
+    // 真实 fs 接线: 摘要文件确实落盘
+    const summary = await fs.readFile(paths.summaryFile, 'utf8')
+    expect(summary).toContain('# 对话历史摘要')
+    // 成功路径观测日志
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('[dsh-memory-manager] turn/end #10 compressed, summary written'))
+    info.mockRestore()
+    vi.unstubAllGlobals()
+  })
+
+  it('uses event data path and never throws on missing workspace (fail-open 入口)', async () => {
+    const session = { id: SessionId('h-nope'), header: { cwd: `${tmpRoot}/nope` }, events: [] } as unknown as Session
+    const watcher = new MtimeWatcher()
+    const registry = new PendingWriteRegistry()
+    const trigger = new TurnTrigger({ thresholdTurns: 8 })
+    const stalled = vi.fn(async () => { throw new Error('network down') })
+    vi.stubGlobal('fetch', stalled)
+    await expect(handleTurnEnd({ watcher, registry, trigger, resolved: config, home }, session, event('turn/end', { turn: 1 }))).resolves.toBeUndefined()
+    // turn 1 < 阈值 8 → 不触发压缩
+    await new Promise((r) => { setTimeout(r, 20) })
+    expect(stalled).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })
 
@@ -436,10 +603,24 @@ describe('apply() plugin mount (T16 插件入口)', () => {
     expect(apply.name).toBe('apply')
     expect(os.homedir().length).toBeGreaterThan(0)
     // 触发一次 session/event → apply 注册的回调执行 handleTurnEnd（非 turn/end 直接返回）
-    ctx.emit('session/event', { id: SessionId('s1'), header: { cwd: ws }, events: [] }, event('user/message', { content: 'x' }))
+    ctx.emit('session/event', { id: SessionId('s1'), header: { cwd: ws }, events: [] } as unknown as Session, event('user/message', { content: 'x' }))
     // 等待一个 poll tick（10ms 间隔）→ poll 回调执行且不抛错
     await new Promise((r) => { setTimeout(r, 60) })
     // 卸载插件 → 清理 poll 定时器 (ctx.effect yield disposer)
     await fiber.dispose()
+  })
+
+  it('mounts with a liveness log and polls live session cwds via the sessions service', async () => {
+    const ctx = new Context()
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    // 提供 sessions 服务 → apply 的 poll 从活动会话取 cwd 跑 audit（生产接线路径）
+    const store = { list: () => [{ header: { cwd: ws } }] } as unknown as SessionStore
+    ctx.provide('sessions', store)
+    const fiber = await ctx.plugin(apply, { pollIntervalMs: 10 } as const)
+    // 挂载存活日志（可观测性 #3）
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('[dsh-memory-manager] mounted'))
+    await new Promise((r) => { setTimeout(r, 80) })
+    await fiber.dispose()
+    info.mockRestore()
   })
 })

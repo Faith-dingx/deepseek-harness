@@ -16,6 +16,10 @@ export interface SummarizeConfig {
   readonly model: string
   readonly timeoutMs?: number
   readonly maxSummaryLines?: number
+  /** Max still-useful segments sent to the LLM (newest win). */
+  readonly summarizeMaxSegments?: number
+  /** Per-segment char cap for the LLM payload (truncated with an ellipsis). */
+  readonly llmSegmentChars?: number
 }
 
 /** One still-useful segment handed to the summarizer. */
@@ -45,10 +49,11 @@ export function fallbackSummary(
   currentTaskContext: string,
   now: Date,
   maxSummaryLines = 50,
+  coverageRange = '第 3-8 轮（保留最近 2 轮原文）',
 ): string {
   const lines: string[] = ['# 对话历史摘要', '']
   lines.push(`> 生成时间：${humanTime(now.toISOString())}`)
-  lines.push('> 覆盖范围：第 3-8 轮（保留最近 2 轮原文）')
+  lines.push(`> 覆盖范围：${coverageRange}`)
   lines.push('> 压缩策略：基于内容甄别的结构化摘要（已过时/无用内容已归档）')
   lines.push('')
   for (const section of SUMMARY_SECTIONS) {
@@ -77,7 +82,16 @@ function trimTo(content: string, max: number): string {
   return single.length > max ? `${single.slice(0, max - 1)}…` : single
 }
 
-/** One batched model call; null on any failure (fail-open). */
+/** Truncate a segment's content for the LLM payload (原始 content 不改). */
+function renderForLLM(content: string, maxChars: number): string {
+  return content.length > maxChars ? `${content.slice(0, maxChars)}…` : content
+}
+
+/**
+ * One batched model call; null on any failure (fail-open). Only the NEWEST
+ * `summarizeMaxSegments` segments (time-ascending → slice(-N)) reach the LLM;
+ * each content is truncated to `llmSegmentChars` (大窗口防护, 9888 latency).
+ */
 async function callSummarizer(
   usefulSegments: readonly UsefulSegment[],
   currentTaskContext: string,
@@ -87,6 +101,10 @@ async function callSummarizer(
   const controller = new AbortController()
   const timeout = setTimeout(() => { controller.abort() }, config.timeoutMs ?? DEFAULT_TIMEOUT_MS)
   try {
+    const maxSegments = config.summarizeMaxSegments ?? Number.POSITIVE_INFINITY
+    const llmSegments = usefulSegments.length > maxSegments
+      ? usefulSegments.slice(-maxSegments)
+      : usefulSegments
     const body = {
       model: config.model,
       messages: [
@@ -96,7 +114,7 @@ async function callSummarizer(
         },
         {
           role: 'user',
-          content: `当前任务上下文：\n${currentTaskContext}\n\n仍有用历史片段：\n${usefulSegments.map(s => `[${s.turnId}] ${s.content}`).join('\n')}`,
+          content: `当前任务上下文：\n${currentTaskContext}\n\n仍有用历史片段：\n${llmSegments.map(s => `[${s.turnId}] ${renderForLLM(s.content, config.llmSegmentChars ?? Number.POSITIVE_INFINITY)}`).join('\n')}`,
         },
       ],
       temperature: 0,
@@ -128,11 +146,12 @@ export async function generateSummary(
   usefulSegments: readonly UsefulSegment[],
   currentTaskContext: string,
   config: SummarizeConfig,
-  _coverageRange: string,
+  coverageRange: string,
   generatedAtIso: string,
   fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<string> {
   const modelText = await callSummarizer(usefulSegments, currentTaskContext, config, fetchImpl)
   if (modelText !== null) return modelText
-  return fallbackSummary(usefulSegments, currentTaskContext, new Date(generatedAtIso), config.maxSummaryLines ?? 50)
+  // fail-open 兜底: 摘要必须始终产出; 覆盖范围用真实窗口 (不再硬编码 第 3-8 轮)
+  return fallbackSummary(usefulSegments, currentTaskContext, new Date(generatedAtIso), config.maxSummaryLines ?? 50, coverageRange)
 }

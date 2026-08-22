@@ -42,6 +42,24 @@ export const PENDING_WRITE_TTL_MS = 5000
 /** LLM classify confidence below this degrades to rules/review (§4.2.2). */
 export const CLASSIFY_CONFIDENCE_THRESHOLD = 0.6
 
+/**
+ * LLM tuning defaults for the 9888 router (实测根因修复): the gateway latency
+ * grows with payload size (7.5KB → 4.4s, 93.7KB → 10.7s), so the old
+ * hardcoded 10s timeout aborted every real 100KB+ session window. Timeouts
+ * are raised to 25s, and the payload is bounded by batch caps + per-segment
+ * truncation so the latency stays predictable.
+ */
+/** Classify LLM call timeout (9888 gateway, 大窗口防护). */
+export const DEFAULT_CLASSIFY_TIMEOUT_MS = 25000
+/** Summarize LLM call timeout (9888 gateway, 大窗口防护). */
+export const DEFAULT_SUMMARIZE_TIMEOUT_MS = 25000
+/** Max pending segments sent to the classify LLM in one batch (newest win). */
+export const DEFAULT_CLASSIFY_MAX_BATCH = 60
+/** Max still-useful segments sent to the summarize LLM (newest win). */
+export const DEFAULT_SUMMARIZE_MAX_SEGMENTS = 30
+/** Per-segment char cap for LLM payloads (truncated with an ellipsis marker). */
+export const DEFAULT_LLM_SEGMENT_CHARS = 400
+
 /** The 9888 router endpoint used for classify + summarize LLM calls. */
 export const DEFAULT_ENDPOINT = 'http://10.10.10.2:9888/v1/chat/completions'
 /** Default cheap model for classify + summarize (计划 v18 §8.3-T12). */
@@ -182,6 +200,16 @@ export interface PluginConfig {
   pendingWriteTtlMs?: number
   /** Classify confidence threshold (§4.2.2). */
   classifyConfidenceThreshold?: number
+  /** Classify LLM call timeout (9888 gateway, 大窗口防护). */
+  classifyTimeoutMs?: number
+  /** Summarize LLM call timeout (9888 gateway, 大窗口防护). */
+  summaryTimeoutMs?: number
+  /** Max pending segments sent to the classify LLM in one batch (newest win). */
+  classifyMaxBatch?: number
+  /** Max still-useful segments sent to the summarize LLM (newest win). */
+  summarizeMaxSegments?: number
+  /** Per-segment char cap for LLM payloads (truncated with an ellipsis marker). */
+  llmSegmentChars?: number
   /** Maintenance: archive files older than N days get gzip-compressed (§5.3). */
   archiveMaxAgeDays?: number
   /** Maintenance: summary older than N days moves to archive/summaries (§5.3). */
@@ -205,6 +233,11 @@ export interface ResolvedPluginConfig {
   readonly confirmWaitMs: number
   readonly pendingWriteTtlMs: number
   readonly classifyConfidenceThreshold: number
+  readonly classifyTimeoutMs: number
+  readonly summaryTimeoutMs: number
+  readonly classifyMaxBatch: number
+  readonly summarizeMaxSegments: number
+  readonly llmSegmentChars: number
   readonly archiveMaxAgeDays: number
   readonly summaryMaxAgeDays: number
   readonly suggestionMaxAgeDays: number
@@ -223,6 +256,11 @@ export const Config: z<PluginConfig> = z.object({
   confirmWaitMs: z.number().default(CONFIRM_WAIT_MS),
   pendingWriteTtlMs: z.number().default(PENDING_WRITE_TTL_MS),
   classifyConfidenceThreshold: z.number().default(CLASSIFY_CONFIDENCE_THRESHOLD),
+  classifyTimeoutMs: z.number().default(DEFAULT_CLASSIFY_TIMEOUT_MS),
+  summaryTimeoutMs: z.number().default(DEFAULT_SUMMARIZE_TIMEOUT_MS),
+  classifyMaxBatch: z.number().default(DEFAULT_CLASSIFY_MAX_BATCH),
+  summarizeMaxSegments: z.number().default(DEFAULT_SUMMARIZE_MAX_SEGMENTS),
+  llmSegmentChars: z.number().default(DEFAULT_LLM_SEGMENT_CHARS),
   archiveMaxAgeDays: z.number().default(90),
   summaryMaxAgeDays: z.number().default(7),
   suggestionMaxAgeDays: z.number().default(7),
@@ -243,6 +281,11 @@ export function resolveConfig(raw: PluginConfig): ResolvedPluginConfig {
     confirmWaitMs: raw.confirmWaitMs ?? CONFIRM_WAIT_MS,
     pendingWriteTtlMs: raw.pendingWriteTtlMs ?? PENDING_WRITE_TTL_MS,
     classifyConfidenceThreshold: raw.classifyConfidenceThreshold ?? CLASSIFY_CONFIDENCE_THRESHOLD,
+    classifyTimeoutMs: raw.classifyTimeoutMs ?? DEFAULT_CLASSIFY_TIMEOUT_MS,
+    summaryTimeoutMs: raw.summaryTimeoutMs ?? DEFAULT_SUMMARIZE_TIMEOUT_MS,
+    classifyMaxBatch: raw.classifyMaxBatch ?? DEFAULT_CLASSIFY_MAX_BATCH,
+    summarizeMaxSegments: raw.summarizeMaxSegments ?? DEFAULT_SUMMARIZE_MAX_SEGMENTS,
+    llmSegmentChars: raw.llmSegmentChars ?? DEFAULT_LLM_SEGMENT_CHARS,
     archiveMaxAgeDays: raw.archiveMaxAgeDays ?? 90,
     summaryMaxAgeDays: raw.summaryMaxAgeDays ?? 7,
     suggestionMaxAgeDays: raw.suggestionMaxAgeDays ?? 7,

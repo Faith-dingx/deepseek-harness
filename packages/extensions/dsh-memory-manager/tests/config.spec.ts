@@ -3,8 +3,13 @@ import {
   AUDIT_DIR_RELATIVE,
   CLASSIFY_CONFIDENCE_THRESHOLD,
   CONFIRM_WAIT_MS,
+  DEFAULT_CLASSIFY_MAX_BATCH,
+  DEFAULT_CLASSIFY_TIMEOUT_MS,
   DEFAULT_ENDPOINT,
+  DEFAULT_LLM_SEGMENT_CHARS,
   DEFAULT_MODEL,
+  DEFAULT_SUMMARIZE_MAX_SEGMENTS,
+  DEFAULT_SUMMARIZE_TIMEOUT_MS,
   HISTORY_ARCHIVE_RELATIVE,
   MEMORY_DIR,
   PENDING_REVIEW_FILE,
@@ -57,6 +62,14 @@ describe('config constants (计划 v18 §4.2.3 / §5.2 / §8.2-T12)', () => {
     expect(CONFIRM_WAIT_MS).toBe(2000)
     expect(PENDING_WRITE_TTL_MS).toBe(5000)
     expect(CLASSIFY_CONFIDENCE_THRESHOLD).toBe(0.6)
+  })
+
+  it('exposes the LLM tuning defaults for the 9888 router (timeouts, batch caps, segment chars)', () => {
+    expect(DEFAULT_CLASSIFY_TIMEOUT_MS).toBe(25000)
+    expect(DEFAULT_SUMMARIZE_TIMEOUT_MS).toBe(25000)
+    expect(DEFAULT_CLASSIFY_MAX_BATCH).toBe(60)
+    expect(DEFAULT_SUMMARIZE_MAX_SEGMENTS).toBe(30)
+    expect(DEFAULT_LLM_SEGMENT_CHARS).toBe(400)
   })
 })
 
@@ -163,6 +176,26 @@ describe('PluginConfig schema (计划 v18 §8.3-T12)', () => {
     expect(parsed.summaryMaxAgeDays).toBe(7)
     expect(parsed.suggestionMaxAgeDays).toBe(7)
     expect(parsed.maxSummaryLines).toBe(50)
+    expect(parsed.classifyTimeoutMs).toBe(DEFAULT_CLASSIFY_TIMEOUT_MS)
+    expect(parsed.summaryTimeoutMs).toBe(DEFAULT_SUMMARIZE_TIMEOUT_MS)
+    expect(parsed.classifyMaxBatch).toBe(DEFAULT_CLASSIFY_MAX_BATCH)
+    expect(parsed.summarizeMaxSegments).toBe(DEFAULT_SUMMARIZE_MAX_SEGMENTS)
+    expect(parsed.llmSegmentChars).toBe(DEFAULT_LLM_SEGMENT_CHARS)
+  })
+
+  it('parses the LLM tuning overrides (timeouts, batch caps, segment chars)', () => {
+    const parsed = Config({
+      classifyTimeoutMs: 30000,
+      summaryTimeoutMs: 35000,
+      classifyMaxBatch: 40,
+      summarizeMaxSegments: 20,
+      llmSegmentChars: 300,
+    })
+    expect(parsed.classifyTimeoutMs).toBe(30000)
+    expect(parsed.summaryTimeoutMs).toBe(35000)
+    expect(parsed.classifyMaxBatch).toBe(40)
+    expect(parsed.summarizeMaxSegments).toBe(20)
+    expect(parsed.llmSegmentChars).toBe(300)
   })
 
   it('resolveConfig folds raw partials onto the same defaults', () => {
@@ -181,6 +214,15 @@ describe('PluginConfig schema (计划 v18 §8.3-T12)', () => {
     expect(resolved.suggestionMaxAgeDays).toBe(7)
     expect(resolved.maxSummaryLines).toBe(50)
     expect(resolved.historyArchiveRoot).toBeNull()
+  })
+
+  it('resolveConfig folds the LLM tuning fields onto their defaults', () => {
+    const resolved = resolveConfig({ classifyTimeoutMs: 13000, summarizeMaxSegments: 12 })
+    expect(resolved.classifyTimeoutMs).toBe(13000)
+    expect(resolved.summaryTimeoutMs).toBe(DEFAULT_SUMMARIZE_TIMEOUT_MS)
+    expect(resolved.classifyMaxBatch).toBe(DEFAULT_CLASSIFY_MAX_BATCH)
+    expect(resolved.summarizeMaxSegments).toBe(12)
+    expect(resolved.llmSegmentChars).toBe(DEFAULT_LLM_SEGMENT_CHARS)
   })
 
   it('isGlobPattern detects directory-scan templates only', () => {

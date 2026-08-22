@@ -155,3 +155,60 @@ describe('generateSummary (T15 自行实现 LLM 摘要, 不经 compaction-basic)
     expect(text.split('\n').length).toBeLessThanOrEqual(50)
   })
 })
+
+describe('generateSummary batch cap + segment truncation (9888 网关大窗口防护)', () => {
+  function requestPrompt(fetchMock: ReturnType<typeof vi.fn>): string {
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    const body = JSON.parse(init?.body as string) as { messages: { role: string; content: string }[] }
+    return body.messages[1]?.content ?? ''
+  }
+
+  it('sends only the newest summarizeMaxSegments useful segments when over the cap', async () => {
+    const fetchMock = vi.fn(replyMarkdown('# 对话历史摘要\n## Primary Request\n- ok\n'))
+    vi.stubGlobal('fetch', fetchMock)
+    const segments = Array.from({ length: 8 }, (_, i) => useful(`s${i + 1}`, `要点 ${i + 1}`))
+    await generateSummary(segments, 'ctx', { ...config, summarizeMaxSegments: 3 }, '第 3-8 轮（保留最近 2 轮原文）', '2026-08-22T10:00:00Z')
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const prompt = requestPrompt(fetchMock)
+    expect(prompt.match(/\[s\d+\]/g) ?? []).toHaveLength(3)
+    expect(prompt).toContain('[s6]')
+    expect(prompt).toContain('[s8]')
+    expect(prompt).not.toContain('[s1]')
+    expect(prompt).not.toContain('[s5]')
+  })
+
+  it('truncates useful segment content to llmSegmentChars in the request', async () => {
+    const fetchMock = vi.fn(replyMarkdown('# 对话历史摘要\n## Primary Request\n- ok\n'))
+    vi.stubGlobal('fetch', fetchMock)
+    const long = 'x'.repeat(500)
+    await generateSummary([useful('s1', long)], 'ctx', { ...config, llmSegmentChars: 100 }, 'r', '2026-08-22T10:00:00Z')
+    const prompt = requestPrompt(fetchMock)
+    expect(prompt).toContain(`${'x'.repeat(100)}…`)
+    expect(prompt).not.toContain('x'.repeat(101))
+  })
+
+  it('writes the real coverage range into the fallback summary (非硬编码 第 3-8 轮)', async () => {
+    vi.stubGlobal('fetch', async () => { throw new Error('down') })
+    const text = await generateSummary(
+      [useful('t3', '要点 F')],
+      'ctx',
+      config,
+      '第 3-130 轮（保留最近 2 轮原文）',
+      '2026-08-22T10:00:00Z',
+    )
+    expect(text).toContain('> 覆盖范围：第 3-130 轮（保留最近 2 轮原文）')
+    expect(text).not.toContain('> 覆盖范围：第 3-8 轮')
+  })
+
+  it('fallbackSummary accepts an explicit coverage range (直接调用传入值生效)', () => {
+    const text = fallbackSummary(
+      [useful('t3', '要点 G')],
+      'ctx',
+      new Date('2026-08-22T10:00:00Z'),
+      50,
+      '第 3-9 轮（保留最近 2 轮原文）',
+    )
+    expect(text).toContain('> 覆盖范围：第 3-9 轮（保留最近 2 轮原文）')
+  })
+})

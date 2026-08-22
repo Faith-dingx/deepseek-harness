@@ -19,6 +19,8 @@
  */
 
 import os from 'node:os'
+import path from 'node:path'
+import { promises as nodeFs } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import {
@@ -167,7 +169,10 @@ export async function runCompression(
     endpoint: config.summaryEndpoint,
     model: config.classifyModel,
     confidenceThreshold: config.classifyConfidenceThreshold,
-    timeoutMs: 10000,
+    // 实测根因修复: 不再硬编码 10s — 9888 网关 100KB+ payload 延迟 10.7s
+    timeoutMs: config.classifyTimeoutMs,
+    classifyMaxBatch: config.classifyMaxBatch,
+    llmSegmentChars: config.llmSegmentChars,
   }, fetchImpl)
 
   const byId = new Map(segments.map(s => [s.turnId, s]))
@@ -206,8 +211,11 @@ export async function runCompression(
   const summary = await generateSummary(usefulSegments, currentTaskContextOf(session.events), {
     endpoint: config.summaryEndpoint,
     model: config.summaryModel,
-    timeoutMs: 10000,
+    // 实测根因修复: 不再硬编码 10s (同上, 摘要 payload 同样 100KB+)
+    timeoutMs: config.summaryTimeoutMs,
     maxSummaryLines: config.maxSummaryLines,
+    summarizeMaxSegments: config.summarizeMaxSegments,
+    llmSegmentChars: config.llmSegmentChars,
   }, coverage, now.toISOString(), fetchImpl)
   const summaryWrite = await writeSummaryFile(paths.summaryFile, summary, register, fsImpl)
 
@@ -261,6 +269,26 @@ function defaultAuditFs(): AuditFs {
 }
 /* v8 ignore stop */
 
+/**
+ * Production fs surface: node:fs/promises wired into BOTH pipelines so the
+ * compression writes and the audit normalization actually persist. The
+ * default stubs above keep a missing injection from crashing the pipeline,
+ * but apply() must inject this real surface — otherwise every write
+ * fail-opens silently and the memory files never change.
+ */
+export function createRealFs(): CompressFs & AuditFs {
+  return {
+    async readFile(file) { return nodeFs.readFile(file, 'utf8') },
+    async writeFile(file, data) {
+      await nodeFs.mkdir(path.dirname(file), { recursive: true })
+      await nodeFs.writeFile(file, data, 'utf8')
+    },
+    async mkdir(dir, options) { await nodeFs.mkdir(dir, options) },
+    async stat(file) { const s = await nodeFs.stat(file); return { size: s.size, mtimeMs: s.mtimeMs } },
+    async readdir(dir) { return nodeFs.readdir(dir) },
+  }
+}
+
 /** One audit pass over the short-term memory files (六步管线一次运行). */
 export async function runAuditOnce(deps: AuditDeps, config: ResolvedPluginConfig): Promise<AuditOutcome> {
   const paths = deps.paths
@@ -310,6 +338,40 @@ export interface PollDeps {
   readonly registry: PendingWriteRegistry
   readonly resolved: ResolvedPluginConfig
   readonly home: string
+  /**
+   * Real fs surface for the audit stage. Absent → the no-op default audit fs
+   * (tests / defensive wiring); apply() always injects {@link createRealFs}.
+   */
+  readonly fsImpl?: CompressFs & AuditFs
+}
+
+/** The session header surface poll targeting needs (cwd only). */
+export interface PollSessionSource {
+  readonly header: { readonly cwd?: string }
+}
+
+/**
+ * Distinct non-empty working directories of live sessions — the actual audit
+ * poll targets (修复B: 不再用 process.cwd()).
+ */
+export function sessionWorkspaces(sessions: readonly PollSessionSource[]): string[] {
+  const cwds = new Set<string>()
+  for (const session of sessions) {
+    if (session.header.cwd !== undefined && session.header.cwd !== '') cwds.add(session.header.cwd)
+  }
+  return [...cwds]
+}
+
+/**
+ * One poll tick: run the audit pass for every distinct live-session workspace.
+ * Returns the cwds that were audited (empty → nothing to audit).
+ */
+export async function pollSessions(deps: PollDeps, sessions: readonly PollSessionSource[]): Promise<string[]> {
+  const cwds = sessionWorkspaces(sessions)
+  for (const cwd of cwds) {
+    await handlePoll(deps, cwd)
+  }
+  return cwds
 }
 
 /**
@@ -318,7 +380,15 @@ export interface PollDeps {
  */
 export async function handlePoll(deps: PollDeps, cwd: string): Promise<void> {
   const paths = resolveMemoryPaths(cwd, deps.home)
-  await runAuditOnce({ watcher: deps.watcher, registry: deps.registry, paths }, deps.resolved)
+  const auditDeps: AuditDeps = {
+    watcher: deps.watcher,
+    registry: deps.registry,
+    paths,
+    ...(deps.fsImpl === undefined ? {} : { fsImpl: deps.fsImpl }),
+  }
+  const outcome = await runAuditOnce(auditDeps, deps.resolved)
+  if (outcome.changed.length === 0) return
+  console.info(`[dsh-memory-manager] poll audit: ${outcome.changed.length} changed, ${outcome.fixed.length} fixed, ${outcome.flagged.length} flagged`)
 }
 
 /** Everything the turn/end entry needs (extracted for testability). */
@@ -341,8 +411,21 @@ export async function handleTurnEnd(deps: TurnEndDeps, session: Session, event: 
   const userMemoryTarget = `${deps.home}/.dsh/memory/MEMORY.md`
   deps.trigger.onTurnEnd(session.id, event.data.turn, async (_sessionId, turn): Promise<void> => {
     try {
-      await runCompression(session, turn, paths, deps.resolved, { registerPendingWrite: register, userMemoryTarget })
-      await runAuditOnce({ watcher: deps.watcher, registry: deps.registry, paths }, deps.resolved)
+      const compressionDeps: CompressionDeps = {
+        registerPendingWrite: register,
+        userMemoryTarget,
+        ...(deps.fsImpl === undefined ? {} : { fsImpl: deps.fsImpl }),
+      }
+      const outcome = await runCompression(session, turn, paths, deps.resolved, compressionDeps)
+      // 可观测日志 #1: 压缩成功路径（全链路日志）
+      console.info(`[dsh-memory-manager] turn/end #${turn} compressed, summary ${outcome.summaryOk ? 'written' : 'failed-open'}`)
+      const auditDeps: AuditDeps = {
+        watcher: deps.watcher,
+        registry: deps.registry,
+        paths,
+        ...(deps.fsImpl === undefined ? {} : { fsImpl: deps.fsImpl }),
+      }
+      await runAuditOnce(auditDeps, deps.resolved)
     } catch (error) {
       // fail-open: every downstream step already contains its own failure
       // containment; this catch is defensive belt-and-braces.
@@ -359,15 +442,21 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
   const watcher = new MtimeWatcher()
   const trigger = new TurnTrigger({ thresholdTurns: resolved.triggerThresholdTurns })
   const home = os.homedir()
+  // 生产必须注入真实 fs（不注入 → 压缩/审核全部静默 no-op，见 createRealFs 注释）
+  const fsImpl = createRealFs()
+  console.info(`[dsh-memory-manager] mounted: turn/end compressor + audit poll wired (poll every ${resolved.pollIntervalMs}ms)`)
 
   ctx.on('session/event', (session: Session, event: SessionEvent): void => {
     /* v8 ignore next -- one-line delegation; handleTurnEnd is fully unit-tested. */
-    void handleTurnEnd({ watcher, registry, trigger, resolved, home }, session, event)
+    void handleTurnEnd({ watcher, registry, trigger, resolved, home, fsImpl }, session, event)
   })
 
   const pollTimer = setInterval(() => {
-    void handlePoll({ watcher, registry, resolved, home }, process.cwd()).catch(
-      /* v8 ignore start -- handlePoll is fail-open by contract and never rejects. */
+    // 修复B: poll 靶标 = 活动会话的 cwd（不再裸用 process.cwd()）
+    const sessions = ctx.get('sessions')?.list() ?? []
+    void pollSessions({ watcher, registry, resolved, home, fsImpl }, sessions).catch(
+      /* v8 ignore start -- every stage is fail-open by contract; this catch
+       * is defensive belt-and-braces only. */
       (error: unknown) => {
         ctx.logger.warn(`[dsh-memory-manager] poll audit failed: ${error instanceof Error ? error.message : String(error)}`)
       },
