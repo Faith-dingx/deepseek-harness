@@ -1,8 +1,8 @@
 # @deepseek-ai/dsh-injection-manager
 
-Memory-file and context-injection manager for DeepSeek Harness. The plugin
-listens on `system-prompt/assemble` and applies, to **every** assembly (root
-agent and sub-agents alike — no agent branching):
+English | [中文](README.zh.md)
+
+Memory-file and context-injection manager for DeepSeek Harness. The plugin listens on `system-prompt/assemble` and applies, to **every** assembly (root agent and sub-agents alike — no agent branching):
 
 | Transform | What it does | Where |
 |-----------|--------------|-------|
@@ -11,8 +11,7 @@ agent and sub-agents alike — no agent branching):
 | Minimal dedup | First occurrence of each section/context name wins; no hashing, no content merging, no priority picking. | `src/dedup.ts` |
 | Fail-open | Any exception returns the downstream `await next()` result; a downstream failure returns the original assembly. Exceptions are logged (event type + reason); the system prompt never collapses because of this plugin. | `src/index.ts` |
 
-The tool cut, layer rules, and short-term names are hardcoded fixed sets
-(`src/config.ts`): no classifier, no task-type branching, no dynamic logic.
+The tool cut, layer rules, and short-term names are hardcoded fixed sets (`src/config.ts`): no classifier, no task-type branching, no dynamic logic.
 
 ## Mounting
 

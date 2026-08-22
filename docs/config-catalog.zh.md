@@ -864,8 +864,8 @@ export interface Config {
 ```ts config-catalog
 /** Gateway config: the listen address. */
 export interface Config {
-  /** Listen host; the two supported values are loopback and all-interfaces. */
-  host: '127.0.0.1' | '0.0.0.0'
+  /** Listen host; any bind address (loopback, all-interfaces, or a specific interface IP). */
+  host: string
   /** Listen port; zero requests an OS-assigned port. */
   port: number
 }
@@ -2832,6 +2832,13 @@ export interface Config {
     /** Global tool names removed from the child. */
     deny?: string[]
   }
+  /**
+   * Optional preset id every child runs on instead of inheriting its parent's
+   * composition. In-process providers join the child to the named preset's
+   * exact tools and prompt sections (an unknown or broken preset fails the
+   * child's start). Per-child `persona` and `toolFilter` still layer on top.
+   */
+  presetId?: string
   /**
    * Maximum child depth: a non-negative safe integer (default `3`; `0` forbids
    * delegation entirely), or `'provider-managed'` to send no cap. A numeric cap

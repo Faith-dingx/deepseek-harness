@@ -1,13 +1,12 @@
 # @deepseek-ai/dsh-guard-main-agent
 
-Guard plugin for the **main orchestration agent**: machine-gates its tool calls so a cheap
-orchestration model can never silently implement code, touch system configuration, or write
-outside its permitted file whitelist — it must delegate instead (五环/四道闸 workflow).
+English | [中文](README.zh.md)
 
-The plugin registers a `tools/pre-execute` listener (documented API, `packages/core/tools`,
-`'tools/pre-execute'`) that runs before every tool executes.
+Guard plugin for the **main orchestration agent**: machine-gates its tool calls so a cheap orchestration model can never silently implement code, touch system configuration, or write outside its permitted file whitelist — it must delegate instead (五环/四道闸 workflow).
 
-## 工作机制（拦截逻辑）
+The plugin registers a `tools/pre-execute` listener (documented API, `packages/core/tools`, `'tools/pre-execute'`) that runs before every tool executes.
+
+## How it works (interception logic)
 
 ```
 工具调用提交 (tools/pre-execute)
@@ -27,7 +26,7 @@ The plugin registers a `tools/pre-execute` listener (documented API, `packages/c
           （plan-reviewer 绝不自动派发：reviewPrompt 交给主 agent 决定）
 ```
 
-## 配置（cordis.yml 插件行）
+## Configuration (cordis.yml plugin line)
 
 ```yaml
 - id: guard-main-agent
@@ -46,44 +45,40 @@ The plugin registers a `tools/pre-execute` listener (documented API, `packages/c
     boundaryDocPath: '…'        # 可选：权威边界文档路径，其文本拼进分类器 system prompt
 ```
 
-## 文件权限门禁（D1，白名单 + fail-close）
+## File-policy gate (whitelist + fail-close)
 
-数据源：`docs/主agent可改写文件清单.yaml`（v2.1）。判定顺序：
+Data source: `docs/主agent可改写文件清单.yaml` (v2.1). Decisions are made in order:
 
-1. **resolve symlink**：`realpath(目标)`；不存在时解析最深存在祖先再拼回后缀（覆盖 create 场景），
-   symlink 指向白名单外 → 拒绝（日志含 resolvedPath）。
-2. **白名单匹配**：prefix / exact，含 `*` 的规则转正则（`*` → `[^/]+` 非斜杠段）。
-3. **类型过滤**：`allowedExtensions` 不在列表 → 拒绝（如 `docs/` 仅 `.md`、`.temp/` 禁可执行脚本）。
-4. **temporaryOverrides**：用户手动在 YAML 追加的临时例外，`expiresAt > now` 生效，
-   过期自动失效（加载即过滤 + 判定时复检）。
-5. **默认拒绝**：未命中任何规则（fail-close），无黑名单概念。
+1. **resolve symlink**: `realpath(target)`; when the target does not exist, resolve the deepest existing ancestor and re-append the suffix (covers the create case); a symlink pointing outside the whitelist is rejected (the log contains the resolvedPath).
+2. **whitelist match**: prefix / exact; a rule containing `*` compiles to a regex (`*` → `[^/]+` non-slash segment).
+3. **type filter**: `allowedExtensions` not in the list → rejected (e.g. `docs/` allows only `.md` and `.temp/` forbids executable scripts).
+4. **temporaryOverrides**: temporary exceptions the user appends to the YAML by hand; `expiresAt > now` takes effect, expiry is automatic (filtered at load + re-checked at decision time).
+5. **default deny**: no rule hit → reject (fail-close); there is no blacklist concept.
 
-清单热重载：写操作每次判定前重读 YAML（文件极小），手动编辑后下一次写操作即生效。
+The manifest hot-reloads: every write decision re-reads the YAML (the file is tiny), so a manual edit takes effect on the next write operation.
 
-## 降级策略
+## Degradation strategy
 
-| 情形 | 行为 |
+| Case | Behavior |
 |---|---|
-| 分类器瞬时超时（AbortError） | **重试 `retryCount` 次（默认 1）**，仍失败才按下行降级；日志 `errorType=timeout` |
-| 分类器真故障（HTTP 4xx/5xx/网络/输出不可解析/caller abort） | **不重试**；代码类工具（bash/terminal/tool-cordis）→ **强制 close**；诊断/只读 → `diagnosticFallback`（默认 open）→ 放行；其余工具 → `fallback`（默认 close）；日志 `errorType=fatal` |
-| 文件清单加载失败 | **deny-all**（fail-close），记录 warning |
-| 子代理派发失败（call_code_agent 不可用） | 记录 warning，deny 依然生效（不因此放行） |
-| 无法从实参提取写路径 | 记录 warning，放行交给工具自身报错 |
+| Classifier transient timeout (AbortError) | **Retries `retryCount` times (default 1)** and only degrades after those also fail; log `errorType=timeout` |
+| Classifier real failure (HTTP 4xx/5xx/network/unparseable output/caller abort) | **No retry**; code-class tools (bash/terminal/tool-cordis) → **forced close**; diagnostic/readonly tools → `diagnosticFallback` (default open) → allow; remaining tools → `fallback` (default close); log `errorType=fatal` |
+| File-manifest load failure | **deny-all** (fail-close), warning logged |
+| Child-agent delegation failure (call_code_agent unavailable) | warning logged, deny still stands (never allows on failure) |
+| No write path extractable from the arguments | warning logged, allow-through so the tool itself reports the error |
 
-## 日志与可追溯性
+## Logging and traceability
 
-每次决策打印结构化日志（verdict + reason + delegateTo + 来源 + 耗时 ms），
-block 时向对话注入说明（`agent.inject`，含被拦截工具、原因、派发结果；
-classifier 的 reviewPrompt 一并注入，由主 agent 决定是否调用 `call_plan_reviewer`）。
+Every decision prints a structured log (verdict + reason + delegateTo + source + duration ms); a block injects an explanation into the conversation (`agent.inject` with the intercepted tool, the reason and the delegation outcome; the classifier's `reviewPrompt` is injected as well, and the main agent decides whether to call `call_plan_reviewer`).
 
-## 与 skill-router 的关系
+## Relationship with skill-router
 
-- `skill-router`（agent/pre-step）：控制**模型能看到哪些 skill**（能力可见性门禁）。
-- `guard-main-agent`（tools/pre-execute）：控制**模型能否执行越界工具调用**（行为门禁）。
-- 两者互补、可独立启用；共享 9888 分类器约定（endpoint/model/超时/缓存思路），
-  但缓存键、事件点、判定目标互不依赖。
+- `skill-router` (agent/pre-step): controls **which skills the model can see** (capability-visibility gate).
+- `guard-main-agent` (tools/pre-execute): controls **whether the model can execute out-of-bounds tool calls** (behavior gate).
 
-## 测试
+The two complement each other and can be enabled independently; they share the 9888 classifier convention (endpoint/model/timeout/caching ideas), but their cache keys, event points and decision targets are independent.
+
+## Testing
 
 ```bash
 pnpm vitest run packages/extensions/guard-main-agent/
@@ -91,8 +86,8 @@ pnpm vitest run packages/extensions/guard-main-agent/
 # 集成：guard-main-agent.spec.ts（场景1-4 + 文件权限场景5-12）
 ```
 
-## 验证过的接口（POC 结论，见 DSF-work 项目文档 POC 报告）
+## Verified interfaces (POC conclusions, see the DSF-work project POC report)
 
-- `tools/pre-execute`：`packages/core/tools/src/index.ts` L152（payload 含 name/arguments/agent/signal）。
-- deny：返回 `{kind:'deny', reason}`；allow：调 `next()`。
-- 程序化派发：`ToolRuntime.execute`（L1342）；消息注入：`Agent.inject`（dsh-agent runtime-types.ts L143）。
+- `tools/pre-execute`: `packages/core/tools/src/index.ts` L152 (payload carries name/arguments/agent/signal).
+- deny: return `{kind:'deny', reason}`; allow: call `next()`.
+- programmatic delegation: `ToolRuntime.execute` (L1342); message injection: `Agent.inject` (dsh-agent runtime-types.ts L143).
