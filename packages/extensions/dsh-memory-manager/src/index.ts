@@ -23,6 +23,11 @@ import path from 'node:path'
 import { promises as nodeFs } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+// Side-effect type import: pulls in dsh-agent's `AssembleContext.agent`
+// augmentation (runtime-types.ts declare module), the same pattern
+// sandbox-policy uses for context.agent?.session access.
+import type {} from '@deepseek-ai/dsh-agent'
+import type { AssembleContext, PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import {
   kindOfFile,
   resolveConfig,
@@ -37,7 +42,8 @@ import { PendingWriteRegistry, confirmWriteComplete, type ConfirmFs } from './au
 import type { ScanFs } from './audit-pipeline/watcher.ts'
 import { applyNormalization } from './audit-pipeline/archive.ts'
 import { resolveWriteWaitMs } from './config.ts'
-import { TurnTrigger, turnCompressionRange, type CompressionRange } from './history-compressor/trigger.ts'
+import { turnCompressionRange, TurnTrigger, type CompressionRange } from './history-compressor/trigger.ts'
+import { buildSummaryInjection } from './history-compressor/inject.ts'
 import { classifySegments, type ClassifiedResult, type HistoryCategory, type HistorySegment } from './history-compressor/classify.ts'
 import { generateSummary } from './history-compressor/summarize.ts'
 import { writeHistoryArchive, type ArchiveWriteFs, type ArchivedSegment } from './history-compressor/write-archive.ts'
@@ -289,6 +295,53 @@ export function createRealFs(): CompressFs & AuditFs {
   }
 }
 
+/** Injectable surface of the summary-injection hook (fs + home). */
+export interface SummaryInjectionDeps {
+  readonly home: string
+  readonly fsImpl?: CompressFs
+}
+
+/**
+ * The workspace whose summary belongs to an assembly: the agent's session cwd
+ * (same resolution as the turn/end compressor write path), process.cwd() as
+ * the diagnostic/global fallback (计划 v18 §4.2.5).
+ */
+export function assemblyWorkspace(context: AssembleContext): string {
+  return context.agent?.session.header.cwd ?? process.cwd()
+}
+
+/**
+ * The assemble-stage hook (计划 v18 §4.2.5 / T15): read the compressed
+ * conversation summary written by the turn/end compressor
+ * (`conversationsummary-latest.md`, the exact same file `writeSummaryFile`
+ * persists) and contribute it as the `dsh:conversation-summary` context
+ * segment — the name dsh-injection-manager's SHORT_TERM_MEMORY_NAMES already
+ * whitelists. Fail-open by contract: a missing file, an empty file, a read
+ * failure, or an absent fs degrades to the untouched assembly (the summary is
+ * an enhancement, never a blocker).
+ *
+ * @returns the assembly, with the summary context appended when readable.
+ */
+export async function injectConversationSummary(
+  assembly: PromptAssembly,
+  context: AssembleContext,
+  deps: SummaryInjectionDeps,
+): Promise<PromptAssembly> {
+  const fsImpl = deps.fsImpl ?? defaultCompressFs
+  const paths = resolveMemoryPaths(assemblyWorkspace(context), deps.home)
+  try {
+    const text = (await fsImpl.readFile(paths.summaryFile)).trim()
+    if (text.length === 0) return assembly
+    return {
+      ...assembly,
+      contexts: [...assembly.contexts, buildSummaryInjection(text)],
+    }
+  } catch {
+    // 文件不存在/不可读 → 静默跳过 (fail-open, 摘要缺失不改动 system prompt)
+    return assembly
+  }
+}
+
 /** One audit pass over the short-term memory files (六步管线一次运行). */
 export async function runAuditOnce(deps: AuditDeps, config: ResolvedPluginConfig): Promise<AuditOutcome> {
   const paths = deps.paths
@@ -449,6 +502,25 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
   ctx.on('session/event', (session: Session, event: SessionEvent): void => {
     /* v8 ignore next -- one-line delegation; handleTurnEnd is fully unit-tested. */
     void handleTurnEnd({ watcher, registry, trigger, resolved, home, fsImpl }, session, event)
+  })
+
+  // 摘要注入钩子 (计划 v18 §4.2.5 / T15, host 层插件): 在 system-prompt/assemble
+  // 瀑布期把压缩摘要作为 dsh:conversation-summary 上下文段注入。复用 harness 的
+  // assemble 事件 API（与 dsh-injection-manager 同构）; 该事件仅由 systemPrompt
+  // 服务发起, 服务缺席时监听器静默不触发。fail-open: 下游失败返回原 assembly,
+  // 摘要读不到也返回原 assembly。
+  ctx.on('system-prompt/assemble', async (
+    assembly: PromptAssembly,
+    assembleContext: AssembleContext,
+    next: () => Promise<PromptAssembly>,
+  ): Promise<PromptAssembly> => {
+    let assembled: PromptAssembly
+    try {
+      assembled = await next()
+    } catch {
+      return assembly
+    }
+    return injectConversationSummary(assembled, assembleContext, { home, fsImpl })
   })
 
   const pollTimer = setInterval(() => {
