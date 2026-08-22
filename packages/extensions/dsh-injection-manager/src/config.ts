@@ -51,4 +51,5 @@ export const SHORT_TERM_MEMORY_NAMES = [
   'memory:standing',
   'memory:failures',
   'memory:project',
+  'dsh:conversation-summary',
 ] as const
