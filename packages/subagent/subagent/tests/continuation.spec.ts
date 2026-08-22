@@ -114,8 +114,12 @@ async function setupPresetContinuable(adapter: LlmAdapter) {
   ctx.loader.builtins.include = Include
   await mountAgentLoopTestDependencies(ctx)
   const root = mkdtempSync(join(tmpdir(), 'dsh-subagent-preset-continuation-'))
-  roots.push(root)
   const persistenceFiber = await ctx.plugin(JsonlSessionPersistence, { root })
+  const persistedRoot = root
+  cleanups.push(async () => {
+    await persistenceFiber.dispose()
+    rmSync(persistedRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  })
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(AgentPresets, { default: 'coding', roots: PRESET_ROOTS, includeUserRoot: false })
   await ctx.plugin(SubagentRuntime)
