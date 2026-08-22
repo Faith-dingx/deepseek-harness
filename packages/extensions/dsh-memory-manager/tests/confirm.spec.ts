@@ -7,14 +7,20 @@ import {
 } from '../src/audit-pipeline/confirm.ts'
 
 describe('PendingWriteRegistry (计划 v18 §5.2 步骤② pendingWrite map, T3)', () => {
-  it('registers a write before it happens and consumes it once with the source', () => {
+  it('registers a write before it happens and consumes it once with the source + skipAudit=false default', () => {
     const reg = new PendingWriteRegistry()
     reg.register('/ws/.dsh-memory/conversationsummary-latest.md', 'history-compressor', 1000)
     expect(reg.size()).toBe(1)
-    expect(reg.consume('/ws/.dsh-memory/conversationsummary-latest.md', 1500)).toBe('history-compressor')
+    expect(reg.consume('/ws/.dsh-memory/conversationsummary-latest.md', 1500)).toEqual({ source: 'history-compressor', skipAudit: false })
     expect(reg.size()).toBe(0)
     // 消费过即清除: 第二次查不到
     expect(reg.consume('/ws/.dsh-memory/conversationsummary-latest.md', 1600)).toBeNull()
+  })
+
+  it('registers a user-approved-entry write with skipAudit=true (S-1: 插件自写跳过守门)', () => {
+    const reg = new PendingWriteRegistry()
+    reg.register('/u/.dsh/memory/MEMORY.md', 'user-approved-entry', 1000, true)
+    expect(reg.consume('/u/.dsh/memory/MEMORY.md', 1500)).toEqual({ source: 'user-approved-entry', skipAudit: true })
   })
 
   it('expires entries older than the 5s TTL (写后清除, 超时自动清理)', () => {
@@ -28,7 +34,7 @@ describe('PendingWriteRegistry (计划 v18 §5.2 步骤② pendingWrite map, T3)
     const reg = new PendingWriteRegistry()
     reg.register('/a.md', 'turn-stopping', 0)
     reg.register('/b.md', 'history-compressor', 0)
-    expect(reg.consume('/b.md', 100)).toBe('history-compressor')
+    expect(reg.consume('/b.md', 100)?.source).toBe('history-compressor')
     expect(reg.size()).toBe(1)
   })
 

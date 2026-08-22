@@ -37,11 +37,11 @@ export interface DetectedWrite {
 }
 
 /**
- * Enumerate the concrete short-term file list for one workspace: the five
- * fixed targets plus glob-style directory scans (daily logs `*.md` in
- * `.dsh-memory/`, reflections `*.md`). The archive area is never included
- * (计划 v18 §7 协同点 3 — 归档区不触发审核). Fail-open: unreadable
- * directories are skipped.
+ * Enumerate the concrete short-term file list for one workspace: the fixed
+ * targets (home memory files, summary, suggestions, 用户授意入口文件) plus
+ * glob-style directory scans (daily logs `*.md` in `.dsh-memory/`, reflections
+ * `*.md`). The archive area is never included (计划 v18 §7 协同点 3 — 归档区不
+ * 触发审核). Fail-open: unreadable directories are skipped.
  */
 export async function scanShortTermFiles(paths: MemoryPaths, fsImpl: ScanFs = defaultScanFs): Promise<string[]> {
   const targets = [
@@ -50,8 +50,11 @@ export async function scanShortTermFiles(paths: MemoryPaths, fsImpl: ScanFs = de
     paths.userCalendarFile,
     paths.summaryFile,
     paths.suggestionsFile,
+    // H-2: 入口文件从 MemoryPaths 读 (不改 SHORT_TERM_FILES 数组), 由扫描独立接入
+    paths.userEntriesFile,
   ]
-  // 日志: <workspace>/.dsh-memory/*.md（排除摘要文件自身）
+  // 日志: <workspace>/.dsh-memory/*.md（排除摘要文件自身与用户授意入口文件,
+  // 二者已作为固定 target 接入, 避免 changed 列表重复）
   const memoryDir = dirOf(paths.summaryFile)
   try {
     const names = await fsImpl.readdir(memoryDir)
@@ -59,6 +62,7 @@ export async function scanShortTermFiles(paths: MemoryPaths, fsImpl: ScanFs = de
       const full = `${memoryDir}/${name}`
       if (!name.endsWith('.md')) continue
       if (full === paths.summaryFile) continue
+      if (full === paths.userEntriesFile) continue
       targets.push(full)
     }
   } catch {

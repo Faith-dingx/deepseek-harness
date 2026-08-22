@@ -415,7 +415,7 @@ describe('runAuditOnce 六步管线集成 (T16)', () => {
   it('pendingWrite consumption identifies the history-compressor source (T16 端到端)', async () => {
     const registry = new PendingWriteRegistry()
     registry.register('/x.md', 'history-compressor', 0)
-    expect(registry.consume('/x.md', 100)).toBe('history-compressor')
+    expect(registry.consume('/x.md', 100)?.source).toBe('history-compressor')
   })
 })
 

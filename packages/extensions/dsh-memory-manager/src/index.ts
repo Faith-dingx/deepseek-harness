@@ -32,6 +32,7 @@ import {
   kindOfFile,
   resolveConfig,
   resolveMemoryPaths,
+  USER_ENTRIES_FILE,
   type MemoryPaths,
   type PluginConfig,
   type ResolvedPluginConfig,
@@ -41,7 +42,9 @@ import { MtimeWatcher, scanShortTermFiles } from './audit-pipeline/watcher.ts'
 import { PendingWriteRegistry, confirmWriteComplete, type ConfirmFs } from './audit-pipeline/confirm.ts'
 import type { ScanFs } from './audit-pipeline/watcher.ts'
 import { applyNormalization } from './audit-pipeline/archive.ts'
+import { appendAuditLine } from './shared/logger.ts'
 import { resolveWriteWaitMs } from './config.ts'
+import { initUserEntriesFile, processUserEntries } from './user-entry-scanner.ts'
 import { turnCompressionRange, TurnTrigger, type CompressionRange } from './history-compressor/trigger.ts'
 import { buildSummaryInjection } from './history-compressor/inject.ts'
 import { classifySegments, type ClassifiedResult, type HistoryCategory, type HistorySegment } from './history-compressor/classify.ts'
@@ -342,18 +345,40 @@ export async function injectConversationSummary(
   }
 }
 
-/** One audit pass over the short-term memory files (六步管线一次运行). */
+/**
+ * One audit pass over the short-term memory files (六步管线一次运行) + 用户授意
+ * 入口文件扫描 (独立分支)。入口文件绝不进入 normalize/archive。
+ */
 export async function runAuditOnce(deps: AuditDeps, config: ResolvedPluginConfig): Promise<AuditOutcome> {
   const paths = deps.paths
   const fsImpl = deps.fsImpl ?? defaultAuditFs()
   const targets = await scanShortTermFiles(paths, fsImpl)
+  // 用户授意入口文件: 首次扫描不存在则自动创建 (带模板注释, fail-open)
+  await initUserEntriesFile(paths.userEntriesFile, fsImpl)
   const changed = await deps.watcher.detectWrites(targets)
   const fixed: string[] = []
   const flagged: string[] = []
   const failed: string[] = []
+  const now = () => (deps.now ?? (() => new Date()))()
 
-  for (const file of changed) {
-    const source = deps.registry.consume(file) ?? 'unknown'
+  // S-2: 先把入口文件从 changed 列表分离 —— 独立处理分支, 绝不进入
+  // applyNormalization/archive (入口文件不是记忆文件本身)。
+  const entryFiles = changed.filter(file => file.endsWith(USER_ENTRIES_FILE))
+  const memoryChanged = changed.filter(file => !entryFiles.includes(file))
+
+  for (const file of memoryChanged) {
+    const pending = deps.registry.consume(file)
+    if (pending !== null && pending.skipAudit) {
+      // S-1: skipAudit=true 的 pendingWrite (用户授意入口通道插件自写) → 直接标记
+      // fixed, 跳过 confirm/normalize/archive, 只记审计 (内容已由三层防线验证)。
+      fixed.push(file)
+      await appendAuditLine(paths.auditDir, {
+        time: now().toISOString(), event: 'user-entry-skip-audit', file,
+        detail: 'user-approved-entry write already validated by the entry scanner',
+      })
+      continue
+    }
+    const source = pending?.source ?? 'unknown'
     /* v8 ignore start -- confirmWriteComplete is fail-open by contract and
      * never rejects; this catch is defensive belt-and-braces only. */
     try {
@@ -375,12 +400,29 @@ export async function runAuditOnce(deps: AuditDeps, config: ResolvedPluginConfig
       continue
     }
     const result = await applyNormalization(file, kindOfFile(file, paths), content, {
-      now: (deps.now ?? (() => new Date()))(),
+      now: now(),
       pendingReviewPath: paths.pendingReviewFile,
       auditDir: paths.auditDir,
     }, fsImpl)
     if (result.fixed) fixed.push(file)
     if (result.flagged) flagged.push(file)
+  }
+
+  for (const entryFile of entryFiles) {
+    try {
+      // 用户授意入口文件: 独立处理 (扫描→三层防线验证→写入目标→审计)。
+      // 入口文件本身不参与 normalize/archive (S-2)。
+      await processUserEntries(entryFile, {
+        paths,
+        registry: deps.registry,
+        fsImpl,
+        now: now(),
+      })
+    } catch {
+      /* v8 ignore next -- processUserEntries is fail-open by contract and
+       * never throws; this catch is defensive belt-and-braces only. */
+      failed.push(entryFile)
+    }
   }
   return { scanned: targets, changed, fixed, flagged, failed }
 }
@@ -497,7 +539,9 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
   const home = os.homedir()
   // 生产必须注入真实 fs（不注入 → 压缩/审核全部静默 no-op，见 createRealFs 注释）
   const fsImpl = createRealFs()
-  console.info(`[dsh-memory-manager] mounted: turn/end compressor + audit poll wired (poll every ${resolved.pollIntervalMs}ms)`)
+  // 用户授意入口文件路径 (诊断/兜底 cwd 解析, 各会话工作区见 MemoryPaths)
+  const entryPath = resolveMemoryPaths(process.cwd(), home).userEntriesFile
+  console.info(`[dsh-memory-manager] mounted: turn/end compressor + audit poll wired (poll every ${resolved.pollIntervalMs}ms), user-entries channel: ${entryPath}`)
 
   ctx.on('session/event', (session: Session, event: SessionEvent): void => {
     /* v8 ignore next -- one-line delegation; handleTurnEnd is fully unit-tested. */

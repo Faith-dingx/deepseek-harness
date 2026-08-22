@@ -1,6 +1,7 @@
 /**
  * 定期维护 (计划 v18 §5.3 / T10): daily巡检 + 过时内容识别 + 摘要清理 +
- * 建议条目清理 + 审计日志归档 + 归档区 gzip 整理. Every action is
+ * 建议条目清理 + 待审队列 (pending-review) 7 天 TTL 清理 + 审计日志归档 +
+ * 归档区 gzip 整理. Every action is
  * fail-open (a failing file is skipped, never throws) and the archive area is
  * only ever READ by the maintenance scan — the audit pipeline's watch list is
  * separate and never sees archive writes (避免循环触发).
@@ -10,7 +11,7 @@
 
 import { gzipSync } from 'node:zlib'
 import { kindOfFile, type MemoryPaths, type ResolvedPluginConfig } from '../config.ts'
-import { applyNormalization, readPendingReview } from './archive.ts'
+import { applyNormalization, readPendingReview, writePendingReview, type PendingReviewEntry } from './archive.ts'
 import { parseSuggestionEntries } from '../shared/validators.ts'
 
 /** File-system surface for maintenance; injectable for tests. */
@@ -39,6 +40,7 @@ export interface MaintenanceReport {
   readonly staleFound: number
   readonly summariesArchived: readonly string[]
   readonly suggestionsExpired: number
+  readonly pendingReviewsExpired: number
   readonly auditArchived: readonly string[]
   readonly archivesCompressed: readonly string[]
   readonly pendingCount: number
@@ -213,6 +215,33 @@ function dateOfDayName(date: Date): string {
 }
 
 /**
+ * Remove pending-review entries older than the window (用户授意入口通道队列
+ * 与超三类标记共用, 7 天 TTL, §2.7). Fail-open: 缺失/损坏文件读作空。
+ */
+export async function cleanupExpiredPendingReviews(
+  path: string,
+  maxAgeDays: number,
+  now: Date,
+  fsImpl: MaintenanceFs,
+): Promise<{ removed: number; remaining: number }> {
+  const entries = await readPendingReview(path, fsImpl)
+  if (entries.length === 0) return { removed: 0, remaining: 0 }
+  const cutoff = now.getTime() - maxAgeDays * 24 * 60 * 60 * 1000
+  const kept: PendingReviewEntry[] = []
+  let removed = 0
+  for (const entry of entries) {
+    const ts = Date.parse(entry.time)
+    if (Number.isFinite(ts) && ts < cutoff) {
+      removed += 1
+    } else {
+      kept.push(entry)
+    }
+  }
+  if (removed > 0) await writePendingReview(path, kept, fsImpl)
+  return { removed, remaining: kept.length }
+}
+
+/**
  * Run the complete maintenance pass (计划 v18 §5.3 维护流程). Serial,
  * fail-open, returns a structured report.
  */
@@ -265,6 +294,8 @@ export async function runMaintenance(
     paths.summaryFile, paths.summariesArchiveDir, config.summaryMaxAgeDays, now, fsImpl, statOf,
   )
   const suggestions = await cleanupExpiredSuggestions(paths.suggestionsFile, config.suggestionMaxAgeDays, now, fsImpl)
+  // 用户授意入口通道队列 + 超三类标记队列: 7 天 TTL (沿用 suggestionMaxAgeDays)
+  const pendingReviews = await cleanupExpiredPendingReviews(paths.pendingReviewFile, config.suggestionMaxAgeDays, now, fsImpl)
   const pending = await readPendingReview(paths.pendingReviewFile, fsImpl)
   const auditArchived = await archiveOldAuditLogs(paths.auditDir, `${paths.auditDir}/../archive/audit`, 30, now, fsImpl)
   const archivesCompressed = await consolidateHistoryArchives(paths.historyArchiveRoot, config.archiveMaxAgeDays, now, fsImpl, statOf)
@@ -274,6 +305,7 @@ export async function runMaintenance(
     staleFound,
     summariesArchived,
     suggestionsExpired: suggestions.removed,
+    pendingReviewsExpired: pendingReviews.removed,
     auditArchived,
     archivesCompressed,
     pendingCount: pending.length,

@@ -20,6 +20,12 @@ export const SUMMARY_FILE = 'conversationsummary-latest.md'
 export const PENDING_SUGGESTIONS_FILE = 'pending-suggestions.json'
 /** Pending-review queue for out-of-category / semantic issues (§5.2 步骤④). */
 export const PENDING_REVIEW_FILE = 'pending-review.json'
+/**
+ * 用户授意记忆入口文件 (计划-用户授意记忆入口写入 v2 §2.1)。用户/主 agent 把
+ * 用户授意要记的内容写进此文件, 插件经三层防线确认后规范化写入目标记忆文件。
+ * 仅用户直接编辑; guard 白名单不含此路径 (defaultPolicy: deny 即拦截)。
+ */
+export const USER_ENTRIES_FILE = 'user-entries.md'
 /** History archive root (过时/无用), NOT audited (§3.7). */
 export const HISTORY_ARCHIVE_RELATIVE = '.dsh-memory/archive/history'
 /** Expired-summary archive directory (§5.3). */
@@ -75,14 +81,18 @@ export type WriteSource =
   | 'turn-stopping' // auto-memory turn-stopping appendText
   | 'persona-learning'
   | 'history-compressor' // this plugin's summary/suggestion writes
+  | 'user-approved-entry' // 用户授意入口通道: 插件自写目标记忆文件 (skip-audit)
   | 'unknown'
 
-export const WRITE_SOURCES: readonly WriteSource[] = ['model-explicit', 'turn-stopping', 'persona-learning', 'history-compressor', 'unknown'] as const
+export const WRITE_SOURCES: readonly WriteSource[] = ['model-explicit', 'turn-stopping', 'persona-learning', 'history-compressor', 'user-approved-entry', 'unknown'] as const
 
 /** Wait budget before reading a file after its write source was identified. */
 export function resolveWriteWaitMs(source: WriteSource): number {
   switch (source) {
     case 'model-explicit':
+      return 0
+    case 'user-approved-entry':
+      // 插件自写 (用户授意入口通道), 无需等待
       return 0
     case 'turn-stopping':
     case 'persona-learning':
@@ -95,12 +105,16 @@ export function resolveWriteWaitMs(source: WriteSource): number {
 
 /** Concrete paths of the memory system for one workspace + home. */
 export interface MemoryPaths {
+  /** 工作区根目录 (项目路径解析 <workspace>/projects/&lt;name&gt;/docs/MEMORY.md 需要). */
+  readonly workspaceRoot: string
   readonly userMemoryFile: string
   readonly userProfileFile: string
   readonly userCalendarFile: string
   readonly summaryFile: string
   readonly suggestionsFile: string
   readonly pendingReviewFile: string
+  /** 用户授意记忆入口文件 (仅用户直接编辑, 插件扫描处理)。 */
+  readonly userEntriesFile: string
   readonly auditDir: string
   readonly reflectionsDir: string
   readonly historyArchiveRoot: string
@@ -116,12 +130,14 @@ export function resolveMemoryPaths(workspaceRoot: string, homeDir: string): Memo
   const memory = path.join(workspaceRoot, MEMORY_DIR)
   const user = userMemoryDir(homeDir)
   return {
+    workspaceRoot,
     userMemoryFile: path.join(user, 'MEMORY.md'),
     userProfileFile: path.join(user, 'USER.md'),
     userCalendarFile: path.join(user, 'CALENDAR.md'),
     summaryFile: path.join(memory, SUMMARY_FILE),
     suggestionsFile: path.join(memory, PENDING_SUGGESTIONS_FILE),
     pendingReviewFile: path.join(memory, PENDING_REVIEW_FILE),
+    userEntriesFile: path.join(memory, USER_ENTRIES_FILE),
     auditDir: path.join(memory, 'audit'),
     reflectionsDir: path.join(memory, 'reflections'),
     historyArchiveRoot: path.join(memory, 'archive', 'history'),
@@ -168,6 +184,8 @@ export function resolveAllTargets(workspaceRoot: string, homeDir: string): strin
 
 /** Map a short-term file path to its content kind for the audit pass. */
 export function kindOfFile(path: string, paths: MemoryPaths): MemoryFileKindLike {
+  // 用户授意入口文件: 专属 kind (L-1), 绝不落入 log 兜底被当日志规范化
+  if (path === paths.userEntriesFile || path.endsWith(`/${USER_ENTRIES_FILE}`)) return 'user-entries'
   if (path === paths.summaryFile || path.endsWith(`/${SUMMARY_FILE}`)) return 'summary'
   if (path === paths.suggestionsFile || path.endsWith(`/${PENDING_SUGGESTIONS_FILE}`)) return 'suggestions'
   if (path === paths.userCalendarFile) return 'calendar'
@@ -177,7 +195,7 @@ export function kindOfFile(path: string, paths: MemoryPaths): MemoryFileKindLike
 }
 
 /** The audit content kinds (unions with the validator's MemoryFileKind). */
-export type MemoryFileKindLike = 'memory' | 'log' | 'reflection' | 'summary' | 'suggestions' | 'calendar'
+export type MemoryFileKindLike = 'memory' | 'log' | 'reflection' | 'summary' | 'suggestions' | 'calendar' | 'user-entries'
 
 /**
  * Plugin configuration (计划 v18 §8.3-T12). All fields optional with the

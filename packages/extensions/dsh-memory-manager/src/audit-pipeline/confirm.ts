@@ -35,33 +35,45 @@ export function sleep(ms: number): Promise<void> {
 /**
  * pendingWrite map: register before writing, consume after the watcher
  * detects the change, TTL-expire stale entries (计划 v18 §5.2, default 5s).
+ * Registration may carry `skipAudit` (用户授意入口通道: 插件自写目标记忆文件,
+ * 内容已由三层防线验证 → 审核管线识别后跳过 normalize/archive)。
  */
 export class PendingWriteRegistry {
-  private readonly map = new Map<string, { source: WriteSource; timestamp: number }>()
+  private readonly map = new Map<string, { source: WriteSource; timestamp: number; skipAudit: boolean }>()
 
   constructor(private readonly ttlMs = 5000) {}
 
-  /** Record an upcoming write so the confirm stage can identify its source. */
-  register(file: string, source: WriteSource, now = Date.now()): void {
-    this.map.set(file, { source, timestamp: now })
+  /**
+   * Record an upcoming write so the confirm stage can identify its source.
+   * `skipAudit` (default false) marks plugin-validated writes whose content
+   * must not re-enter the normalize/archive gate.
+   */
+  register(file: string, source: WriteSource, now = Date.now(), skipAudit = false): void {
+    this.map.set(file, { source, timestamp: now, skipAudit })
   }
 
   /**
-   * Consume one pending entry. Returns its source when present and fresh,
-   * otherwise null (unknown-source fallback path in the caller).
+   * Consume one pending entry. Returns `{source, skipAudit}` when present and
+   * fresh, otherwise null (unknown-source fallback path in the caller).
    */
-  consume(file: string, now = Date.now()): WriteSource | null {
+  consume(file: string, now = Date.now()): ConsumedPendingWrite | null {
     const pending = this.map.get(file)
     if (pending === undefined) return null
     this.map.delete(file)
     if (now - pending.timestamp >= this.ttlMs) return null
-    return pending.source
+    return { source: pending.source, skipAudit: pending.skipAudit }
   }
 
   /** Number of currently registered (unconsumed) entries. */
   size(): number {
     return this.map.size
   }
+}
+
+/** One consumed pendingWrite: the write source + whether audit should skip. */
+export interface ConsumedPendingWrite {
+  readonly source: WriteSource
+  readonly skipAudit: boolean
 }
 
 /** Result of the write-complete confirmation (serializable, T5). */

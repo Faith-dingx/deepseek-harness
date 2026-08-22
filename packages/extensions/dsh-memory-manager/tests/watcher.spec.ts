@@ -102,12 +102,14 @@ describe('MtimeWatcher (计划 v18 §5.2 步骤①, T3)', () => {
 
 describe('scanShortTermFiles (计划 v18 §5.2 步骤① 扫描, T3/T16)', () => {
   const paths: MemoryPaths = {
+    workspaceRoot: '/ws',
     userMemoryFile: '/u/.dsh/memory/MEMORY.md',
     userProfileFile: '/u/.dsh/memory/USER.md',
     userCalendarFile: '/u/.dsh/memory/CALENDAR.md',
     summaryFile: '/ws/.dsh-memory/conversationsummary-latest.md',
     suggestionsFile: '/ws/.dsh-memory/pending-suggestions.json',
     pendingReviewFile: '/ws/.dsh-memory/pending-review.json',
+    userEntriesFile: '/ws/.dsh-memory/user-entries.md',
     auditDir: '/ws/.dsh-memory/audit',
     reflectionsDir: '/ws/.dsh-memory/reflections',
     historyArchiveRoot: '/ws/.dsh-memory/archive/history',
@@ -126,10 +128,23 @@ describe('scanShortTermFiles (计划 v18 §5.2 步骤① 扫描, T3/T16)', () =>
     expect(targets).toContain('/u/.dsh/memory/MEMORY.md')
     expect(targets).toContain('/ws/.dsh-memory/2026-08-22.md')
     expect(targets).toContain('/ws/.dsh-memory/reflections/2026-08-22.md')
+    // H-2: 用户授意入口文件从 MemoryPaths 接入 targets (不改 SHORT_TERM_FILES 数组)
+    expect(targets).toContain(paths.userEntriesFile)
     // 摘要文件自身不重复出现在日志扫描中; 非 md 被过滤
     expect(targets.filter(t => t === paths.summaryFile)).toHaveLength(1)
     expect(targets.some(t => t.endsWith('notes.txt'))).toBe(false)
     expect(targets.some(t => t.endsWith('readme.txt'))).toBe(false)
+  })
+
+  it('includes the entry file in the glob scan at most once (固定 target + 日志 glob 去重)', async () => {
+    const scan: ScanFs = {
+      async readdir(dir) {
+        if (dir === '/ws/.dsh-memory') return ['user-entries.md', '2026-08-22.md']
+        return []
+      },
+    }
+    const targets = await scanShortTermFiles(paths, scan)
+    expect(targets.filter(t => t.endsWith('user-entries.md'))).toHaveLength(1)
   })
 
   it('uses the default node fs scan over a real directory (defaultScanFs)', async () => {
@@ -166,6 +181,7 @@ describe('scanShortTermFiles (计划 v18 §5.2 步骤① 扫描, T3/T16)', () =>
       '/u/.dsh/memory/CALENDAR.md',
       '/ws/.dsh-memory/conversationsummary-latest.md',
       '/ws/.dsh-memory/pending-suggestions.json',
+      '/ws/.dsh-memory/user-entries.md',
     ])
   })
 })

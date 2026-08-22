@@ -81,7 +81,8 @@ export async function readPendingReview(path: string, fsImpl: ArchiveFs): Promis
   }
 }
 
-async function writePendingReview(path: string, entries: readonly PendingReviewEntry[], fsImpl: ArchiveFs): Promise<void> {
+/** Serialize the pending-review queue (exported for maintenance TTL cleanup). */
+export async function writePendingReview(path: string, entries: readonly PendingReviewEntry[], fsImpl: ArchiveFs): Promise<void> {
   await fsImpl.mkdir(requireDir(path), { recursive: true })
   await fsImpl.writeFile(path, `${JSON.stringify({ entries }, null, 2)}\n`)
 }

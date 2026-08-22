@@ -22,9 +22,11 @@ import {
   SUMMARIES_ARCHIVE_RELATIVE,
   SUMMARY_FILE,
   TRIGGER_THRESHOLD_TURNS,
+  USER_ENTRIES_FILE,
   WRITE_SOURCES,
   Config,
   isGlobPattern,
+  kindOfFile,
   resolveAllTargets,
   resolveConfig,
   resolveMemoryPaths,
@@ -37,6 +39,8 @@ describe('config constants (计划 v18 §4.2.3 / §5.2 / §8.2-T12)', () => {
     expect(SUMMARY_FILE).toBe('conversationsummary-latest.md')
     expect(PENDING_SUGGESTIONS_FILE).toBe('pending-suggestions.json')
     expect(PENDING_REVIEW_FILE).toBe('pending-review.json')
+    // 用户授意记忆入口文件 (计划-用户授意记忆入口写入 v2 §2.1)
+    expect(USER_ENTRIES_FILE).toBe('user-entries.md')
   })
 
   it('archive roots live under .dsh-memory/archive and are NOT audit targets', () => {
@@ -79,6 +83,7 @@ describe('resolveMemoryPaths (计划 v18 §3.7 / §4.2.3)', () => {
 
   it('maps the workspace .dsh-memory layout (summary, suggestions, audit, reflections, archives)', () => {
     const p = resolveMemoryPaths(workspace, home)
+    expect(p.workspaceRoot).toBe('/ws')
     expect(p.summaryFile).toBe('/ws/.dsh-memory/conversationsummary-latest.md')
     expect(p.suggestionsFile).toBe('/ws/.dsh-memory/pending-suggestions.json')
     expect(p.pendingReviewFile).toBe('/ws/.dsh-memory/pending-review.json')
@@ -86,6 +91,8 @@ describe('resolveMemoryPaths (计划 v18 §3.7 / §4.2.3)', () => {
     expect(p.reflectionsDir).toBe('/ws/.dsh-memory/reflections')
     expect(p.historyArchiveRoot).toBe('/ws/.dsh-memory/archive/history')
     expect(p.summariesArchiveDir).toBe('/ws/.dsh-memory/archive/summaries')
+    // 用户授意入口文件 (v2 §2.1)
+    expect(p.userEntriesFile).toBe('/ws/.dsh-memory/user-entries.md')
   })
 
   it('maps the user-level ~/.dsh/memory files (MEMORY / USER / CALENDAR)', () => {
@@ -125,15 +132,31 @@ describe('WRITE_SOURCES (计划 v18 §5.2 步骤②)', () => {
       'turn-stopping',
       'persona-learning',
       'history-compressor',
+      'user-approved-entry',
       'unknown',
     ])
     expect(resolveWriteWaitMs('model-explicit')).toBe(0)
+    expect(resolveWriteWaitMs('user-approved-entry')).toBe(0) // 插件自写, 无需等待
     expect(resolveWriteWaitMs('turn-stopping')).toBe(500)
     expect(resolveWriteWaitMs('persona-learning')).toBe(500)
     expect(resolveWriteWaitMs('history-compressor')).toBe(500)
     expect(resolveWriteWaitMs('unknown')).toBe(2000)
     // unknown 是显式降级兜底, 不额外放宽
     expect(resolveWriteWaitMs('unknown')).toBe(2000)
+  })
+})
+
+describe('kindOfFile (用户授意入口文件专属 kind, L-1)', () => {
+  const paths = resolveMemoryPaths('/ws', '/home/u')
+  it('returns user-entries for the entry file (exact path and any path ending with user-entries.md)', () => {
+    expect(kindOfFile(paths.userEntriesFile, paths)).toBe('user-entries')
+    expect(kindOfFile('/other/ws/.dsh-memory/user-entries.md', paths)).toBe('user-entries')
+  })
+
+  it('never falls back to log for the entry file (避免被当日志规范化)', () => {
+    expect(kindOfFile(paths.userEntriesFile, paths)).not.toBe('log')
+    expect(kindOfFile('/ws/.dsh-memory/2026-08-22.md', paths)).toBe('log')
+    expect(kindOfFile(paths.summaryFile, paths)).toBe('summary')
   })
 })
 

@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest'
 import {
   classifyEntryLine,
   parseSuggestionEntries,
+  parseUserEntries,
+  resolveTargetPath,
   validateSuggestionTarget,
   validateMemoryFile,
+  validateUserEntry,
   type ValidationIssue,
 } from '../src/shared/validators.ts'
+import { resolveMemoryPaths } from '../src/config.ts'
 
 describe('classifyEntryLine (计划 v18 §5.2 步骤④ 三类规矩判定, T2)', () => {
   it('recognizes file-pointer lines (②关键文件指针)', () => {
@@ -186,6 +190,12 @@ describe('validateMemoryFile (计划 v18 §3.x 各文件类型校验, T2)', () =
     expect(result.ok).toBe(true)
     expect(result.issues).toEqual([])
   })
+
+  it('user-entries kind is a dedicated no-op kind (L-1: 不当日志校验/规范化)', () => {
+    const result = validateMemoryFile('user-entries', '[source=user] [target=memory] 任意内容\n- 内容\n', {})
+    expect(result.ok).toBe(true)
+    expect(result.issues).toEqual([])
+  })
 })
 
 describe('issue shape', () => {
@@ -194,5 +204,193 @@ describe('issue shape', () => {
     const issue: ValidationIssue | undefined = result.issues[0]
     expect(typeof issue?.severity).toBe('string')
     expect(typeof issue?.autoFixable).toBe('boolean')
+  })
+})
+
+describe('parseUserEntries (用户授意入口 v2 §2.3 格式), 防线 2', () => {
+  const valid = [
+    '[source=user] [target=memory] 用户说："工作完成后必须立即记录"',
+    '- 用户偏好：工作完成后立即记录到工作区文档，不询问',
+  ].join('\n')
+
+  it('parses a header + content block into one entry (source/target/project/quote/content/raw)', () => {
+    const entries = parseUserEntries(valid)
+    expect(entries).toHaveLength(1)
+    const entry = entries[0]
+    expect(entry?.headerLine).toBe(1)
+    expect(entry?.source).toBe('user')
+    expect(entry?.target).toBe('memory')
+    expect(entry?.project).toBeNull()
+    expect(entry?.quote).toBe('工作完成后必须立即记录')
+    expect(entry?.content).toBe('用户偏好：工作完成后立即记录到工作区文档，不询问')
+    expect(entry?.raw).toBe(valid)
+  })
+
+  it('parses multiple entries and skips comments/blank lines', () => {
+    const text = [
+      '# 用户授意条目',
+      '',
+      '<!-- 用户授意条目 -->',
+      '[source=user] [target=user] 用户说："重启 dsh 是用户专属操作"',
+      '- 重启 dsh 是用户专属操作，主 agent 不得自行重启',
+      '',
+      '[source=user] [target=project] [project=dsh-memory-manager] 用户说："插件模块化设计要清晰"',
+      '- 完成：插件模块化设计评审',
+      '',
+    ].join('\n')
+    const entries = parseUserEntries(text)
+    expect(entries).toHaveLength(2)
+    expect(entries[0]?.target).toBe('user')
+    expect(entries[0]?.headerLine).toBe(4)
+    expect(entries[1]?.target).toBe('project')
+    expect(entries[1]?.project).toBe('dsh-memory-manager')
+    expect(entries[1]?.headerLine).toBe(7)
+  })
+
+  it('joins multiple consecutive content lines with newline (内容行不丢失)', () => {
+    const text = [
+      '[source=user] [target=memory] 用户说："记录项目规划"',
+      '- 完成：项目规划',
+      '- 指针：docs/CHANGELOG.md',
+    ].join('\n')
+    const entries = parseUserEntries(text)
+    expect(entries[0]?.content).toBe('完成：项目规划\n指针：docs/CHANGELOG.md')
+    expect(entries[0]?.raw).toContain('- 完成：项目规划')
+  })
+
+  it('ignores a bullet line without an open entry header (孤立内容行)', () => {
+    const entries = parseUserEntries('- 无标题的内容行\n\n')
+    expect(entries).toHaveLength(0)
+  })
+
+  it('handles a bare dash bullet and a stray non-bullet line while an entry is open', () => {
+    const text = [
+      '[source=user] [target=memory] 用户说："x"',
+      '-',     // 裸 - 内容行 → 空内容 (missing-content 由校验判)
+      '无关行', // 条目打开时的非内容行 → 忽略
+    ].join('\n')
+    const entries = parseUserEntries(text)
+    expect(entries).toHaveLength(1)
+    expect(entries[0]?.content).toBe('')
+    expect(entries[0]?.raw).toBe('[source=user] [target=memory] 用户说："x"\n-')
+  })
+
+  it('a header without a [target=] tag yields target=null (invalid-target 判给校验)', () => {
+    const entries = parseUserEntries('[source=user] 用户说："x"\n- 内容\n')
+    expect(entries[0]?.target).toBeNull()
+  })
+
+  it('a quoted-but-empty attribution yields no quote (missing-quote 判给校验)', () => {
+    const entries = parseUserEntries('[source=user] [target=memory] 用户说：" "\n- 内容\n')
+    expect(entries[0]?.quote).toBeNull()
+  })
+
+  it('accepts a tag-less entry header (有 target 无 source → source=null, 由校验判 missing-source)', () => {
+    const entries = parseUserEntries('[target=memory] 用户说："工作完成后必须记录"\n- 内容\n')
+    expect(entries).toHaveLength(1)
+    expect(entries[0]?.source).toBeNull()
+    expect(entries[0]?.target).toBe('memory')
+  })
+
+  it('extracts quotes in 用户说：/裸引号/中文引号 forms (风险表容错)', () => {
+    const ascii = parseUserEntries('[source=user] [target=memory] 用户说："工作完成后必须记录"\n- 用户偏好：x\n')
+    expect(ascii[0]?.quote).toBe('工作完成后必须记录')
+    const cn = parseUserEntries('[source=user] [target=memory] 用户说：「重启是用户专属操作」\n- 用户偏好：x\n')
+    expect(cn[0]?.quote).toBe('重启是用户专属操作')
+    const bare = parseUserEntries('[source=user] [target=memory] "工作完成后必须记录"\n- 用户偏好：x\n')
+    expect(bare[0]?.quote).toBe('工作完成后必须记录')
+  })
+})
+
+describe('validateUserEntry (防线 2: source 强制 / 原话引用必需 / target 合法 / 三类校验)', () => {
+  function entry(source: string, target: string, extra = '', quote = '用户说："工作完成后必须立即记录"', content = '- 用户偏好：工作完成后立即记录，不询问'): string {
+    return `[source=${source}] [target=${target}]${extra === '' ? '' : ` ${extra}`} ${quote}\n${content}\n`
+  }
+
+  it('write: 合法条目 (source=user + 引用 + target + 三类合规内容) 放行', () => {
+    const parsed = parseUserEntries(entry('user', 'memory'))[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    const result = validateUserEntry(parsed)
+    expect(result.disposition).toBe('write')
+    expect(result.issues).toEqual([])
+  })
+
+  it('skip: source ≠ user → 静默跳过 (不写目标, 不写 pending-review)', () => {
+    const parsed = parseUserEntries(entry('agent', 'memory'))[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    const result = validateUserEntry(parsed)
+    expect(result.disposition).toBe('skip')
+    expect(result.issues.some(i => i.code === 'invalid-source')).toBe(true)
+  })
+
+  it('pending-review: 无 source 标签 (伪造条目)', () => {
+    const parsed = parseUserEntries('[target=memory] 用户说："x"\n- 用户偏好：x\n')[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    const result = validateUserEntry(parsed)
+    expect(result.disposition).toBe('pending-review')
+    expect(result.issues.some(i => i.code === 'missing-source')).toBe(true)
+  })
+
+  it('pending-review: 无用户原话引用 (反伪造核心, 防线 2)', () => {
+    const parsed = parseUserEntries('[source=user] [target=memory] 一些没有引用标识的内容\n- 用户偏好：x\n')[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    const result = validateUserEntry(parsed)
+    expect(result.disposition).toBe('pending-review')
+    expect(result.issues.some(i => i.code === 'missing-quote')).toBe(true)
+  })
+
+  it('pending-review: 非法 target', () => {
+    const parsed = parseUserEntries(entry('user', 'bogus'))[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    const result = validateUserEntry(parsed)
+    expect(result.disposition).toBe('pending-review')
+    expect(result.issues.some(i => i.code === 'invalid-target')).toBe(true)
+  })
+
+  it('pending-review: target=project 缺 project 名 或 项目名非法 (防路径穿越)', () => {
+    const missing = parseUserEntries(entry('user', 'project', '', '用户说："x"', '- 用户偏好：x'))[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    expect(validateUserEntry(missing).issues.some(i => i.code === 'missing-project')).toBe(true)
+    const traversal = parseUserEntries(entry('user', 'project', '[project=../evil]', '用户说："x"', '- 用户偏好：x'))[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    expect(validateUserEntry(traversal).disposition).toBe('pending-review')
+    expect(validateUserEntry(traversal).issues.some(i => i.code === 'invalid-project')).toBe(true)
+  })
+
+  it('pending-review: 缺内容行', () => {
+    const parsed = parseUserEntries('[source=user] [target=memory] 用户说："x"\n')[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    expect(validateUserEntry(parsed).issues.some(i => i.code === 'missing-content')).toBe(true)
+  })
+
+  it('pending-review: 引用与内容逐字相同 (quote-content-mismatch, 反伪造启发)', () => {
+    const parsed = parseUserEntries('[source=user] [target=memory] 用户说："规则：重启必须用户操作"\n- 规则：重启必须用户操作\n')[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    const result = validateUserEntry(parsed)
+    expect(result.disposition).toBe('pending-review')
+    expect(result.issues.some(i => i.code === 'quote-content-mismatch')).toBe(true)
+  })
+
+  it('pending-review: 内容超三类 (non-compliant)', () => {
+    const parsed = parseUserEntries('[source=user] [target=memory] 用户说："今天天气不错"\n- 今天天气不错，心情很好\n')[0] as NonNullable<ReturnType<typeof parseUserEntries>[0]>
+    const result = validateUserEntry(parsed)
+    expect(result.disposition).toBe('pending-review')
+    expect(result.issues.some(i => i.code === 'out-of-category')).toBe(true)
+  })
+})
+
+describe('resolveTargetPath (v2 §2.5 写入映射表 + M-2 项目路径约束)', () => {
+  const paths = resolveMemoryPaths('/ws', '/home/u')
+  const now = new Date('2026-08-22T10:00:00Z')
+
+  it('maps memory/user to the user-level memory files', () => {
+    expect(resolveTargetPath('memory', null, now, paths)).toBe('/home/u/.dsh/memory/MEMORY.md')
+    expect(resolveTargetPath('user', null, now, paths)).toBe('/home/u/.dsh/memory/USER.md')
+  })
+
+  it('maps project to <workspace>/projects/<name>/docs/MEMORY.md (枚举路径)', () => {
+    expect(resolveTargetPath('project', 'dsh-memory-manager', now, paths)).toBe('/ws/projects/dsh-memory-manager/docs/MEMORY.md')
+  })
+
+  it('maps log to the daily log under .dsh-memory (YYYY-MM-DD)', () => {
+    expect(resolveTargetPath('log', null, now, paths)).toBe('/ws/.dsh-memory/2026-08-22.md')
+  })
+
+  it('returns null for missing/invalid project names (不生成越界路径)', () => {
+    expect(resolveTargetPath('project', null, now, paths)).toBeNull()
+    expect(resolveTargetPath('project', '', now, paths)).toBeNull()
+    expect(resolveTargetPath('project', '../evil', now, paths)).toBeNull()
+    expect(resolveTargetPath('project', 'has space', now, paths)).toBeNull()
   })
 })

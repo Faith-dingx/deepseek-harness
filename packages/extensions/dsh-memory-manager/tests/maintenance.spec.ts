@@ -3,6 +3,7 @@ import { gunzipSync } from 'node:zlib'
 import {
   archiveOldAuditLogs,
   archiveOldSummaries,
+  cleanupExpiredPendingReviews,
   cleanupExpiredSuggestions,
   consolidateHistoryArchives,
   identifyStaleContent,
@@ -51,12 +52,14 @@ function memoryFs(initial: Record<string, string> = {}): MaintenanceFs & { files
 }
 
 const paths: MemoryPaths = {
+  workspaceRoot: '/ws',
   userMemoryFile: '/u/.dsh/memory/MEMORY.md',
   userProfileFile: '/u/.dsh/memory/USER.md',
   userCalendarFile: '/u/.dsh/memory/CALENDAR.md',
   summaryFile: '/ws/.dsh-memory/conversationsummary-latest.md',
   suggestionsFile: '/ws/.dsh-memory/pending-suggestions.json',
   pendingReviewFile: '/ws/.dsh-memory/pending-review.json',
+  userEntriesFile: '/ws/.dsh-memory/user-entries.md',
   auditDir: '/ws/.dsh-memory/audit',
   reflectionsDir: '/ws/.dsh-memory/reflections',
   historyArchiveRoot: '/ws/.dsh-memory/archive/history',
@@ -137,6 +140,35 @@ describe('cleanupExpiredSuggestions (T10 建议条目过期清理)', () => {
     const report = await cleanupExpiredSuggestions('/ws/q.json', 7, now, fs)
     expect(report.removed).toBe(0)
     expect(report.remainingIds).toEqual([])
+  })
+})
+
+describe('cleanupExpiredPendingReviews (用户授意入口队列 + 超三类标记, 7 天 TTL, v2 §2.7)', () => {
+  function reviewEntry(id: string, time: string): unknown {
+    return { id, file: '/ws/.dsh-memory/user-entries.md', line: 3, content: 'raw', time, status: 'pending' }
+  }
+
+  it('removes entries older than the window and keeps fresh ones', async () => {
+    const fs = memoryFs({
+      '/ws/.dsh-memory/pending-review.json': JSON.stringify({
+        entries: [reviewEntry('old', '2026-08-01T00:00:00Z'), reviewEntry('fresh', '2026-08-20T00:00:00Z')],
+      }),
+    })
+    const report = await cleanupExpiredPendingReviews('/ws/.dsh-memory/pending-review.json', 7, now, fs)
+    expect(report.removed).toBe(1)
+    expect(report.remaining).toBe(1)
+    const written = JSON.parse(fs.files.get('/ws/.dsh-memory/pending-review.json') ?? '{}') as { entries: { id: string }[] }
+    expect(written.entries.map(e => e.id)).toEqual(['fresh'])
+  })
+
+  it('keeps everything when nothing is stale and tolerates a missing/corrupt file', async () => {
+    const fs = memoryFs({
+      '/ws/.dsh-memory/pending-review.json': JSON.stringify({ entries: [reviewEntry('fresh', '2026-08-20T00:00:00Z')] }),
+    })
+    expect((await cleanupExpiredPendingReviews('/ws/.dsh-memory/pending-review.json', 7, now, fs)).removed).toBe(0)
+    expect((await cleanupExpiredPendingReviews('/missing.json', 7, now, fs)).removed).toBe(0)
+    const corrupt = memoryFs({ '/ws/.dsh-memory/pending-review.json': 'not-json' })
+    expect((await cleanupExpiredPendingReviews('/ws/.dsh-memory/pending-review.json', 7, now, corrupt)).removed).toBe(0)
   })
 })
 
@@ -295,6 +327,7 @@ describe('runMaintenance (计划 v18 §5.3 维护流程, T10)', () => {
     const fs = memoryFs()
     const report = await runMaintenance(paths, config, now, fs, { statOf: () => ({ mtimeMs: now.getTime() }) })
     expect(report.suggestionsExpired).toBe(0)
+    expect(report.pendingReviewsExpired).toBe(0)
     expect(report.summariesArchived).toEqual([])
     expect(report.auditArchived).toEqual([])
     expect(report.archivesCompressed).toEqual([])
