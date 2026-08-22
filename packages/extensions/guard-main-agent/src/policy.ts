@@ -79,6 +79,31 @@ export const CODE_CLASS_TOOLS: ReadonlySet<string> = new Set([
   'tool-cordis',
 ])
 
+/**
+ * Read-only whitelist applied when the auxiliary classifier is unavailable.
+ *
+ * Production incident 2026-08-22: with the 9888 classifier unreachable, the
+ * diagnostic tools (DIAGNOSTIC_TOOLS) kept their zero-gate, but pure status
+ * reads like `job_output` / `list_agents` fell into the generic close
+ * fallback — the main agent lost ALL task visibility and was locked out of
+ * its own work. These tools are pure reads, so classifier failure must fail
+ * open for them unconditionally (write/execute tools keep failing close).
+ */
+export const READONLY_TOOLS: ReadonlySet<string> = new Set([
+  // job/terminal status reads (never write, never execute)
+  'job_output',
+  'terminal_read',
+  // agent roster read (subagent management visibility)
+  'list_agents',
+  // read-only schedule query
+  'calendar_list',
+])
+
+/** Whether a tool name is on the classifier-failure read-only whitelist. */
+export function isReadonlyTool(toolName: string): boolean {
+  return READONLY_TOOLS.has(toolName)
+}
+
 /** Whether a tool name is in the diagnostic/read-only set. */
 export function isDiagnosticTool(toolName: string): boolean {
   return DIAGNOSTIC_TOOLS.has(toolName)
@@ -167,7 +192,21 @@ export function resolveVerdict(input: VerdictInput): PolicyVerdict {
     }
   }
 
-  // Classifier unavailable/unreadable -> fail-close by tool class.
+  // Classifier unavailable/unreadable -> fail-close by tool class. The
+  // read-only whitelist fails OPEN unconditionally so the main agent keeps
+  // task/status visibility even while the classifier is down (2026-08-22
+  // incident); this check runs BEFORE diagnosticFallback so a `close`
+  // diagnostic config can never re-lock the read-only status tools.
+  if (isReadonlyTool(toolName)) {
+    return {
+      verdict: 'allow',
+      reason: 'classifier unavailable; read-only whitelist fail-open',
+      delegateTo: null,
+      reviewPrompt: null,
+      classifierFailed: true,
+      toolName,
+    }
+  }
   if (isDiagnosticTool(toolName)) {
     const mode = config.diagnosticFallback
     return {

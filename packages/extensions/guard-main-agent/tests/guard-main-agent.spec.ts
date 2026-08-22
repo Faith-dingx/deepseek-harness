@@ -213,6 +213,25 @@ describe('guard-main-agent integration (tools/pre-execute)', () => {
     expect(lsp.decision.kind).toBe('allow')
   })
 
+  it('场景3b: read-only whitelist tools (job_output/list_agents) fail open while bash still fails close', async () => {
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(async () => { throw new Error('network down') }, track)
+    const { agent } = agentFor(ws)
+    // Status reads must survive the classifier outage (2026-08-22 incident).
+    const job = await preExecute(ctx, agent, 'job_output', { job_id: 'bash-1' })
+    expect(job.decision.kind).toBe('allow')
+    expect(job.nextCalls).toBe(1)
+    const roster = await preExecute(ctx, agent, 'list_agents', {})
+    expect(roster.decision.kind).toBe('allow')
+    expect(roster.nextCalls).toBe(1)
+    // Execute-class tools still fail close: no silent write/run path.
+    const bash = await preExecute(ctx, agent, 'bash', { command: 'rm -rf /tmp/x' })
+    expect(bash.decision.kind).toBe('deny')
+    expect(bash.nextCalls).toBe(0)
+    // Each read-only call attempted the classifier once (cache is per-task).
+    expect(track.code).toBe(1) // only the blocked bash delegated
+  })
+
   it('场景4: task-switch (user message hash change) refreshes the classification cache', async () => {
     let fetches = 0
     const ctx = await setup(async () => {

@@ -3,8 +3,10 @@ import {
   CODE_CLASS_TOOLS,
   DELEGATION_TOOLS,
   DIAGNOSTIC_TOOLS,
+  READONLY_TOOLS,
   WRITE_TOOLS,
   isDiagnosticTool,
+  isReadonlyTool,
   parseClassifierOutput,
   resolveVerdict,
 } from '../src/policy.ts'
@@ -51,6 +53,25 @@ describe('guard tool classification sets', () => {
   it('CODE_CLASS_TOOLS covers code-executing tools that must fail close', () => {
     expect(CODE_CLASS_TOOLS.has('bash')).toBe(true)
     expect(CODE_CLASS_TOOLS.has('terminal')).toBe(true)
+  })
+
+  it('READONLY_TOOLS covers read-only/status tools that must fail open when the classifier is down', () => {
+    // Production incident 2026-08-22: with the 9888 classifier unreachable,
+    // job_output/list_agents fell into the generic close fallback and the main
+    // agent lost all status visibility. These tools are pure reads.
+    expect(READONLY_TOOLS.has('job_output')).toBe(true)
+    expect(READONLY_TOOLS.has('list_agents')).toBe(true)
+    expect(READONLY_TOOLS.has('terminal_read')).toBe(true)
+    expect(READONLY_TOOLS.has('calendar_list')).toBe(true)
+    // Write/execute tools must NEVER be on the read-only whitelist.
+    expect(READONLY_TOOLS.has('bash')).toBe(false)
+    expect(READONLY_TOOLS.has('write')).toBe(false)
+    expect(READONLY_TOOLS.has('edit')).toBe(false)
+    // Diagnostics already have their own zero-gate / diagnosticFallback path.
+    expect(READONLY_TOOLS.has('read')).toBe(false)
+    // Predicate mirrors the set (true membership / false non-membership).
+    expect(isReadonlyTool('job_output')).toBe(true)
+    expect(isReadonlyTool('bash')).toBe(false)
   })
 })
 
@@ -200,5 +221,43 @@ describe('resolveVerdict — fallback path (classifier failed)', () => {
     })
     expect(ok.classifierFailed).toBe(false)
     expect(ok.toolName).toBe('bash')
+  })
+
+  it('read-only whitelist tools fail open when the classifier is down (incident regression)', () => {
+    // job_output: main agent must keep reading job status while 9888 is down.
+    const job = failed('job_output')
+    expect(job.verdict).toBe('allow')
+    expect(job.delegateTo).toBeNull()
+    expect(job.classifierFailed).toBe(true)
+    expect(job.reason).toContain('fail-open')
+    // list_agents: subagent roster must stay readable.
+    const roster = failed('list_agents')
+    expect(roster.verdict).toBe('allow')
+    expect(roster.delegateTo).toBeNull()
+    // terminal_read: terminal output inspection stays available.
+    const term = failed('terminal_read')
+    expect(term.verdict).toBe('allow')
+    // calendar_list: read-only schedule query stays available.
+    const cal = failed('calendar_list')
+    expect(cal.verdict).toBe('allow')
+  })
+
+  it('read-only whitelist fail-open is unconditional (ignores fallback and diagnosticFallback=close)', () => {
+    for (const cfg of [
+      config({ fallback: 'close' }),
+      config({ fallback: 'close', diagnosticFallback: 'close' }),
+    ]) {
+      const verdict = failed('job_output', cfg)
+      expect(verdict.verdict).toBe('allow')
+      expect(verdict.classifierFailed).toBe(true)
+    }
+  })
+
+  it('write/execute tools still fail close when the classifier is down', () => {
+    for (const toolName of ['bash', 'write', 'edit', 'visit', 'mkdir']) {
+      const verdict = failed(toolName)
+      expect(verdict.verdict, toolName).toBe('block')
+      expect(verdict.classifierFailed).toBe(true)
+    }
   })
 })
