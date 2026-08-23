@@ -37,6 +37,10 @@ pre-commit:
     - name: vendor manifest guard
       run: scripts/check-vendor-manifest.sh
 
+    - name: cordis inject validation
+      glob: 'packages/extensions/*/src/**'
+      run: node scripts/validate-inject.mjs
+
 pre-merge-commit:
   jobs:
     - name: translation pairing (staged records)
