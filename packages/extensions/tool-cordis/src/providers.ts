@@ -4,7 +4,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { HOST_BUILTIN_INSPECTION } from '@deepseek-ai/dsh-cordis-host-runner'
 import type { HostCordisInspectProviderRegistration } from '@deepseek-ai/dsh-cordis-host-runner'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
-import { EVENT_API, queryEventApi, queryServiceApi } from './api-catalog.ts'
+import { EVENT_API, queryEventApi, queryServiceApi } from './generated/api-catalog.ts'
 
 const EMPTY_INPUT = { type: 'object', properties: {}, additionalProperties: false } as const
 const ANY_OUTPUT = { description: 'JSON data owned by this inspect provider.' } as const
