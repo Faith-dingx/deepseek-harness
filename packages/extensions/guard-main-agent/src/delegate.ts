@@ -13,6 +13,7 @@
  * @module @deepseek-ai/dsh-guard-main-agent
  */
 
+import crypto from 'node:crypto'
 import { CallId, boundContextSummary } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
