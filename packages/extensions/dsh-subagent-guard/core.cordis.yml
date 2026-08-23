@@ -1,0 +1,20 @@
+# Cordis module registration for @deepseek-ai/dsh-subagent-guard.
+#
+# This package publishes two cordis modules; both are referenced by the
+# repository's `@deepseek-ai/dsh-*/invariant` path mapping and, once built,
+# resolve through the package `exports` (lib/index.js).
+#
+# Mounting (host layer, see docs/计划.md T12):
+#   - insert:
+#       - id: dsh-subagent-guard
+#         name: '@deepseek-ai/dsh-subagent-guard'
+#
+modules:
+  - id: dsh-subagent-guard
+    plugin: '@deepseek-ai/dsh-subagent-guard'
+    entry: lib/index.js
+    inject: [subagents, sessions]
+  - id: dsh-subagent-guard-invariant
+    plugin: '@deepseek-ai/dsh-subagent-guard'
+    entry: lib/invariant.js
+    inject: [invariants]

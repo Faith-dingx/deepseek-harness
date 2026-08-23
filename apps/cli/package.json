@@ -57,6 +57,7 @@
     "@deepseek-ai/dsh-guard-main-agent": "workspace:^",
     "@deepseek-ai/dsh-injection-manager": "workspace:^",
     "@deepseek-ai/dsh-memory-manager": "workspace:^",
+    "@deepseek-ai/dsh-subagent-guard": "workspace:^",
     "@deepseek-ai/dsh-jobs-local": "workspace:^",
     "@deepseek-ai/dsh-tmux-context": "workspace:^",
     "@deepseek-ai/dsh-token-meter": "workspace:^",

@@ -240,6 +240,9 @@ importers:
       '@deepseek-ai/dsh-skill-router':
         specifier: workspace:^
         version: link:../../packages/extensions/skill-router
+      '@deepseek-ai/dsh-subagent-guard':
+        specifier: workspace:^
+        version: link:../../packages/extensions/dsh-subagent-guard
       '@deepseek-ai/dsh-terminal':
         specifier: workspace:^
         version: link:../../packages/terminal/terminal
@@ -4336,6 +4339,24 @@ importers:
       '@deepseek-ai/dsh-system-prompt':
         specifier: workspace:^
         version: link:../../core/system-prompt
+
+  packages/extensions/dsh-subagent-guard:
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: workspace:^
+        version: link:../../../vendor/cordis
+      '@deepseek-ai/dsh-agent':
+        specifier: workspace:^
+        version: link:../../core/agent
+      '@deepseek-ai/dsh-session':
+        specifier: workspace:^
+        version: link:../../core/session
+      '@deepseek-ai/dsh-subagent':
+        specifier: workspace:^
+        version: link:../../subagent/subagent
+      '@deepseek-ai/schemastery':
+        specifier: link:../../../vendor/schemastery
+        version: link:../../../vendor/schemastery
 
   packages/extensions/guard-main-agent:
     dependencies:
