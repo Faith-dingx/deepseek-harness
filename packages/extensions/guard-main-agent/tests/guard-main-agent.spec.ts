@@ -433,4 +433,34 @@ describe('classifier timeout jitter regression (计划-guard误拦修复 T5)', (
     // (tools.execute refuses an already-aborted signal): no subagent dispatch.
     expect(track.code).toBeUndefined()
   })
+
+  it('验收11: 清单变更可热重载 —— 编辑 YAML 后下次 pre-execute 即生效', async () => {
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(async () => { throw new Error('network down') }, track)
+    const { agent } = agentFor(ws)
+    const target = path.join(ws, 'docs/report.md')
+
+    // 初次判定：v1 白名单 docs/ 允许 *.md → 放行
+    const before = await preExecute(ctx, agent, 'write', { file_path: target })
+    expect(before.decision.kind).toBe('allow')
+    expect(before.nextCalls).toBe(1)
+
+    // 收紧白名单：docs/ 仅允许 *.txt → 同一路径应转为拒绝
+    const tightened = `
+defaultPolicy: deny
+symlinkResolve: true
+whitelist:
+  - type: prefix
+    value: "${ws}/docs/"
+    allowedExtensions: [".txt"]
+    reason: "收紧后仅允许 txt"
+temporaryOverrides: []
+`
+    await fs.writeFile(whitelistPath, tightened, 'utf8')
+
+    // 下次 pre-execute 必须读到新清单（验收11 热重载）→ 拒绝且不派发
+    const after = await preExecute(ctx, agent, 'write', { file_path: target })
+    expect(after.decision.kind).toBe('deny')
+    expect(after.nextCalls).toBe(0)
+  })
 })

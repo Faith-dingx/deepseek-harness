@@ -98,31 +98,24 @@ export function apply(ctx: Context, config: Config = {}): void {
   const resolved = resolveConfig(config)
   const cache = new TTLMap<string, ClassifierOutput>(resolved.cacheMax, resolved.cacheTtlMs)
 
-  // File policy per workspace, loaded lazily on first write-tool call and
-  // RE-READ on every evaluation so manual whitelist edits hot-reload (v2.1 §5.1).
-  const policyByCwd = new Map<string, FilePolicy>()
-
+  // File policy RE-READ on every evaluation so whitelist edits hot-reload
+  // (计划-主agent可改写文件清单 验收11: 编辑 YAML 后插件下次 pre-execute 即生效).
+  // The whitelist file is tiny and main-agent write calls are rare; the
+  // per-call cost is one small read + parse, so no cache is kept.
   const policyFor = async (cwd: string): Promise<FilePolicy> => {
-    const cached = policyByCwd.get(cwd)
-    if (cached !== undefined) return cached
-    let policy: FilePolicy
     if (resolved.filePolicyPath === null) {
       // No policy configured: fail closed (deny all) rather than guess.
       ctx.logger.warn('[guard-main-agent] filePolicyPath not configured; all file writes denied (fail-close)')
-      policy = denyAllFilePolicy(cwd)
-    } else {
-      try {
-        const yamlPath = path.resolve(cwd, resolved.filePolicyPath)
-        const text = await fs.readFile(yamlPath, 'utf8')
-        policy = createFilePolicy(parsePolicy(text), { cwd })
-        ctx.logger.info(`[guard-main-agent] file policy loaded from ${yamlPath}`)
-      } catch (error) {
-        ctx.logger.warn(`[guard-main-agent] file policy load failed (${error instanceof Error ? error.message : String(error)}); fail-close`)
-        policy = denyAllFilePolicy(cwd)
-      }
+      return denyAllFilePolicy(cwd)
     }
-    policyByCwd.set(cwd, policy)
-    return policy
+    try {
+      const yamlPath = path.resolve(cwd, resolved.filePolicyPath)
+      const text = await fs.readFile(yamlPath, 'utf8')
+      return createFilePolicy(parsePolicy(text), { cwd })
+    } catch (error) {
+      ctx.logger.warn(`[guard-main-agent] file policy load failed (${error instanceof Error ? error.message : String(error)}); fail-close`)
+      return denyAllFilePolicy(cwd)
+    }
   }
 
   ctx.on('tools/pre-execute', async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
