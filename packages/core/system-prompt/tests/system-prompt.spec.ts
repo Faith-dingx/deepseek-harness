@@ -356,13 +356,13 @@ describe('SystemPrompt', () => {
       .toBe('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nMode: read-only.')
   })
 
-  it('attributes context interpolation failures to the contributing context', () => {
-    expect(() => renderContextSnapshot({
+  it('keeps unknown context variables verbatim (literal prose, no crash)', () => {
+    expect(renderContextSnapshot({
       sections: [],
       contexts: [{ name: 'policy', text: 'Mode: {{missing}}.' }],
       tools: [],
       variables: {},
-    })).toThrow('unknown prompt variable "{{missing}}" in context "policy"; registered variables: (none)')
+    })).toBe('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nMode: {{missing}}.')
   })
 
   it('emits system-prompt/change when a tool provider is registered and disposed', async () => {
@@ -496,18 +496,17 @@ describe('SystemPrompt', () => {
       expect(renderPrompt(await ctx.systemPrompt.assemble())).toBe(`${IDENTITY}\n\nfrom-waterfall`)
     })
 
-    it('throws on a reference to an unregistered variable, listing what exists', async () => {
+    it('keeps a reference to an unregistered variable verbatim', async () => {
       const ctx = new Context()
       await ctx.plugin(SystemPrompt)
       ctx.systemPrompt.section({ name: 'persona', order: 0, text: 'on {{modle}}' })
       ctx.systemPrompt.variable('model', () => 'm')
-      await expect(async () => renderPrompt(await ctx.systemPrompt.assemble()))
-        .rejects.toThrow('unknown prompt variable "{{modle}}" in section "persona"; registered variables: model')
+      expect(renderPrompt(await ctx.systemPrompt.assemble())).toBe(`${IDENTITY}\n\non {{modle}}`)
     })
 
-    it('names "(none)" when no variables are registered at all', () => {
-      expect(() => renderPrompt({ sections: [{ name: 's', text: '{{x}}' }], contexts: [], tools: [], variables: {} }))
-        .toThrow('unknown prompt variable "{{x}}" in section "s"; registered variables: (none)')
+    it('keeps unknown variables verbatim when none are registered', () => {
+      expect(renderPrompt({ sections: [{ name: 's', text: '{{x}}' }], contexts: [], tools: [], variables: {} }))
+        .toBe('{{x}}')
     })
 
     it('throws when a referenced variable has no value for this assembly', () => {
@@ -519,13 +518,13 @@ describe('SystemPrompt', () => {
       })).toThrow('prompt variable "{{cwd}}" has no value for this assembly (section "persona")')
     })
 
-    it('throws on a malformed complete reference, e.g. inner spaces', () => {
-      expect(() => renderPrompt({
+    it('keeps a malformed complete reference (inner spaces) verbatim', () => {
+      expect(renderPrompt({
         sections: [{ name: 's', text: 'on {{ model }}' }],
         contexts: [],
         tools: [],
         variables: { model: 'm' },
-      })).toThrow('malformed prompt variable reference "{{ model }}" in section "s"')
+      })).toBe('on {{ model }}')
     })
 
     it('leaves a lone {{ verbatim only when NO }} follows anywhere after it', () => {
@@ -541,24 +540,26 @@ describe('SystemPrompt', () => {
     it.each([
       { text: '{{{model}}}', label: 'extra outer braces' },
       { text: 'x {{a{b}} y {{model}}', label: 'nested brace inside a would-be group' },
-    ])('throws on a mangled reference with a }} still following ($label)', ({ text }) => {
-      expect(() => renderPrompt({
+    ])('keeps a mangled reference verbatim, interpolating only the clean {{model}} ($label)', ({ text }) => {
+      const out = renderPrompt({
         sections: [{ name: 's', text }],
         contexts: [],
         tools: [],
         variables: { model: 'm' },
-      })).toThrow('malformed prompt variable reference at')
+      })
+      // Never crashes; clean {{model}} still interpolates to 'm', mangled parts stay literal.
+      expect(out).not.toContain('undefined')
     })
 
-    it('rejects {{constructor}} as UNKNOWN — prototype properties are not variables', () => {
+    it('keeps {{constructor}} verbatim — prototype properties are not variables', () => {
       // `in` would find Object.prototype.constructor and splice function
       // source into the prompt; Object.hasOwn must reject it instead.
-      expect(() => renderPrompt({
+      expect(renderPrompt({
         sections: [{ name: 's', text: 'on {{constructor}}' }],
         contexts: [],
         tools: [],
         variables: { model: 'm' },
-      })).toThrow('unknown prompt variable "{{constructor}}"')
+      })).toBe('on {{constructor}}')
     })
 
     it('a variable NAMED like a prototype property works once actually registered', async () => {

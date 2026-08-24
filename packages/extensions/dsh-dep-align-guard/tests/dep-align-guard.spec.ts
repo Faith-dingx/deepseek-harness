@@ -180,6 +180,26 @@ describe('detectPnpmOperation（纯函数）', () => {
   it('命令链中多个 pnpm 操作全部识别（install && deploy）', () => {
     expect(guard.detectPnpmOperations('CI=true pnpm install && CI=true pnpm deploy --prod')).toEqual(['install', 'deploy'])
   })
+
+  it('引号包裹、注释行、解释性文本中的 pnpm 不是依赖操作（文本误判修复）', () => {
+    // 引号包裹（单/双引号）：整段被引号包住的 pnpm 命令不起作用
+    expect(guard.detectPnpmOperations('echo "注意别乱跑 pnpm install"')).toEqual([])
+    expect(guard.detectPnpmOperations("echo '请勿 pnpm add lodash'")).toEqual([])
+    expect(guard.detectPnpmOperations('不要执行 "pnpm prune"')).toEqual([])
+    expect(guard.detectPnpmOperations('先读文档 "pnpm deploy --prod" 再动手')).toEqual([])
+    // 注释行（含缩进）
+    expect(guard.detectPnpmOperations('# 注意别乱跑 pnpm install')).toEqual([])
+    expect(guard.detectPnpmOperations('  # 修复前先 pnpm update 对齐')).toEqual([])
+    // 命令内的内联注释
+    expect(guard.detectPnpmOperations('echo done # 请勿 pnpm install')).toEqual([])
+    // 普通字符串/解释性文本（非命令位置）
+    expect(guard.detectPnpmOperations('echo 注意别乱跑 pnpm install')).toEqual([])
+    // 真实命令不受影响（防过度过滤回归）
+    expect(guard.detectPnpmOperations('pnpm install')).toEqual(['install'])
+    expect(guard.detectPnpmOperations('echo hi && pnpm install')).toEqual(['install'])
+    expect(guard.detectPnpmOperations('CI=true pnpm install --no-frozen-lockfile')).toEqual(['install'])
+    expect(guard.detectPnpmOperations('echo 警告 && pnpm add x && echo ok')).toEqual(['add'])
+  })
 })
 
 describe('detectDepOperation（纯函数、分支全覆盖）', () => {

@@ -9,6 +9,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -132,7 +133,9 @@ function installPairingProbeFixture(root: string): void {
   symlinkSync(tsxPackageDirectory, join(root, 'node_modules/tsx'), linkType)
 }
 
-function createFixture(names: { main?: string; linked?: string } = {}): Fixture {
+function createFixture(
+  names: { main?: string; linked?: string; fakeLefthook?: boolean; pairingProbe?: boolean } = {},
+): Fixture {
   const container = mkdtempSync(join(tmpdir(), 'dsh-lefthook-'))
   fixtures.push(container)
   const main = join(container, names.main ?? 'main')
@@ -159,10 +162,14 @@ function createFixture(names: { main?: string; linked?: string } = {}): Fixture 
   git(fixture, main, ['worktree', 'add', '-b', 'linked', linked])
   write(join(main, 'lefthook.yml'), 'main-worktree-config\n')
   write(join(linked, 'lefthook.yml'), 'linked-worktree-config\n')
-  installFakeLefthook(main)
-  installFakeLefthook(linked)
-  installPairingProbeFixture(main)
-  installPairingProbeFixture(linked)
+  if (names.fakeLefthook ?? true) {
+    installFakeLefthook(main)
+    installFakeLefthook(linked)
+  }
+  if (names.pairingProbe ?? true) {
+    installPairingProbeFixture(main)
+    installPairingProbeFixture(linked)
+  }
   return fixture
 }
 
@@ -239,6 +246,47 @@ describe('worktree-local Lefthook installer', { timeout: 30_000 }, () => {
       ]).status).toBe(1)
     })
   }
+
+  it('writes a devDeps-missing alert and exits 0 when the lefthook binary is absent', async () => {
+    const fixture = createFixture({ fakeLefthook: false, pairingProbe: false })
+    const alertPath = join(
+      fixture.env.HOME ?? fixture.container,
+      '.dsh', '.alerts', 'lefthook-install-failed.json',
+    )
+
+    const result = await runInstaller(fixture, fixture.main)
+
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.stderr).toContain('[dsh-boot] WARN')
+    expect(result.stderr).toContain('lefthook 缺失，疑似 devDeps 被误删')
+    expect(existsSync(alertPath)).toBe(true)
+    if (process.platform !== 'win32') {
+      expect(statSync(alertPath).mode & 0o777).toBe(0o600)
+    }
+    const alert = JSON.parse(readFileSync(alertPath, 'utf8')) as {
+      source?: string
+      error?: { message?: string }
+    }
+    expect(alert.source).toBe('scripts/install-lefthook.mjs')
+    expect(alert.error?.message).toContain('lefthook 缺失，疑似 devDeps 被误删（故障一）')
+    if (process.platform !== 'win32') {
+      expect(alert.error?.message).toContain('node_modules/.bin/lefthook')
+    }
+  })
+
+  it('keeps skipping hook installation silently under CI when the binary is absent', async () => {
+    const fixture = createFixture({ fakeLefthook: false, pairingProbe: false })
+    const alertPath = join(
+      fixture.env.HOME ?? fixture.container,
+      '.dsh', '.alerts', 'lefthook-install-failed.json',
+    )
+
+    const result = await runInstaller(fixture, fixture.main, { CI: 'true' })
+
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.stderr).not.toContain('[dsh-boot] WARN')
+    expect(existsSync(alertPath)).toBe(false)
+  })
 
   it('isolates main and linked worktrees without changing legacy common hooks', async () => {
     const fixture = createFixture()

@@ -13,8 +13,8 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { spawnSync } from 'node:child_process'
+import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
-import lefthookPackage from 'lefthook/package.json' with { type: 'json' }
 
 const MINIMUM_GIT = [2, 26, 0]
 const HOOKS_DIRECTORY = 'dsh-hooks'
@@ -688,15 +688,47 @@ function probePairingMergeDriver(root) {
   capture(process.execPath, PAIRING_MERGE_DRIVER_PROBE, { cwd: root })
 }
 
+function writeLefthookAlert(message, stack) {
+  const alertDir = join(homedir(), '.dsh', '.alerts')
+  mkdirSync(alertDir, { recursive: true })
+  const alertPath = join(alertDir, 'lefthook-install-failed.json')
+  const payload = {
+    updatedAt: new Date().toISOString(),
+    source: 'scripts/install-lefthook.mjs',
+    error: {
+      message,
+      stack,
+    },
+  }
+  writeFileSync(alertPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
+  return alertPath
+}
+
 async function main() {
   if (process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true') return
-  if (typeof lefthookPackage.bin?.lefthook !== 'string') return
   const probe = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' })
   if (probe.status !== 0) return
   const root = stripGitLineTerminator(probe.stdout)
   const isWindows = process.platform === 'win32'
   const lefthook = join(root, 'node_modules', '.bin', isWindows ? 'lefthook.cmd' : 'lefthook')
-  if (!existsSync(lefthook)) return
+  if (!existsSync(lefthook)) {
+    const message = `lefthook 缺失，疑似 devDeps 被误删（故障一）: expected binary at ${lefthook}`
+    console.error(`[dsh-boot] WARN: ${message}`)
+    try {
+      const alertPath = writeLefthookAlert(message)
+      console.error(`[dsh-boot] WARN: lefthook alert written to ${alertPath}`)
+    } catch (alertError) {
+      console.error(
+        `[dsh-boot] WARN: could not write lefthook missing alert — `
+        + `${alertError instanceof Error ? alertError.message : String(alertError)}`,
+      )
+    }
+    return
+  }
+  const { default: lefthookPackage } = await import('lefthook/package.json', {
+    with: { type: 'json' },
+  })
+  if (typeof lefthookPackage.bin?.lefthook !== 'string') return
 
   assertSupportedGit(root)
   const gitDirectory = stripGitLineTerminator(git(['rev-parse', '--absolute-git-dir'], root).stdout)
@@ -840,6 +872,16 @@ async function main() {
 try {
   await main()
 } catch (error) {
-  console.error(`[install-lefthook] ${error instanceof Error ? error.message : String(error)}`)
+  const message = error instanceof Error ? error.message : String(error)
+  console.error(`[dsh-boot] CRIT: lefthook installation failed — ${message}`)
+  try {
+    const alertPath = writeLefthookAlert(message, error instanceof Error ? error.stack : undefined)
+    console.error(`[dsh-boot] CRIT: alert written to ${alertPath}`)
+  } catch (alertError) {
+    console.error(
+      `[dsh-boot] CRIT: could not write lefthook install alert — `
+      + `${alertError instanceof Error ? alertError.message : String(alertError)}`,
+    )
+  }
   process.exitCode = 1
 }

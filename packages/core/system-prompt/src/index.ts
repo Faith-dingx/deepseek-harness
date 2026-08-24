@@ -266,10 +266,9 @@ function interpolate(
   for (let open = text.indexOf('{{'); open >= 0; open = text.indexOf('{{', last)) {
     const group = GROUP_AT.exec(text.slice(open))
     if (group === null) {
-      // A later closing brace makes this malformed; otherwise it is literal prose.
-      if (text.indexOf('}}', open + 2) >= 0) {
-        throw new Error(`malformed prompt variable reference at "${text.slice(open, open + 16)}…" in ${kind} "${input.name}" (references are complete simple {{name}} groups)`)
-      }
+      // Not a well-formed {{name}} group (e.g. `{{a{b}}` or a lone `{{` with no
+      // closing pair) — keep the two brace chars verbatim. This is literal
+      // prose/code, not a template reference; never crash the turn on it.
       result += text.slice(last, open + 2)
       last = open + 2
       continue
@@ -277,15 +276,28 @@ function interpolate(
     // `{{}}` yields an empty name and follows the malformed-reference path.
     const name = group[0].slice(2, -2)
     if (!VARIABLE_NAME.test(name)) {
-      throw new Error(`malformed prompt variable reference "{{${name}}}" in ${kind} "${input.name}" (variable names match ${String(VARIABLE_NAME)})`)
+      // Not a valid variable reference (e.g. `{{ commit }}` with spaces, or a
+      // symbol like `{{some-name}}`). This is almost always literal prose
+      // describing a placeholder (memory/summary text), not a template
+      // reference — keep it verbatim instead of crashing the turn.
+      console.warn(`[system-prompt] keeping literal "{{${name}}}" in ${kind} "${input.name}" (variable names must match ${String(VARIABLE_NAME)})`)
+      result += text.slice(last, open + group[0].length)
+      last = open + group[0].length
+      continue
     }
-    // Do not resolve unregistered names through Object.prototype.
+    // Do not resolve unregistered names through Object.prototype. An unknown
+    // name is most likely literal prose (e.g. a memory entry describing a
+    // `{{commit}}` placeholder); keep it as-is instead of crashing the turn.
     if (!Object.hasOwn(variables, name)) {
       const known = Object.keys(variables)
-      throw new Error(`unknown prompt variable "{{${name}}}" in ${kind} "${input.name}"; registered variables: ${known.length > 0 ? known.join(', ') : '(none)'}`)
+      console.warn(`[system-prompt] keeping literal "{{${name}}}" in ${kind} "${input.name}" (unknown variable; registered: ${known.length > 0 ? known.join(', ') : '(none)'})`)
+      result += text.slice(last, open + group[0].length)
+      last = open + group[0].length
+      continue
     }
     const value = variables[name]
     if (value === undefined) {
+      // A registered variable with no value is a real wiring bug — fail loud.
       throw new Error(`prompt variable "{{${name}}}" has no value for this assembly (${kind} "${input.name}")`)
     }
     result += text.slice(last, open) + value

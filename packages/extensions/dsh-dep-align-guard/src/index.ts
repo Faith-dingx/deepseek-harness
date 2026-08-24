@@ -192,13 +192,69 @@ export function detectPnpmOperation(command: string): string | null {
 }
 
 /**
+ * pnpm 之前的 shell 命令前缀词：这些词后紧跟的仍是命令位置
+ * （区别于 echo/printf 等解释性文本——那些词后的 pnpm 只是被谈论的内容）。
+ */
+const COMMAND_PREFIX_WORDS = new Set(['sudo', 'env', 'time', 'command', 'nohup', 'xargs'])
+
+/**
+ * 判定 `pnpm` 匹配位置是否为真实命令位置（纯词法扫描的误判修复）：
+ * - 引号内（单/双）不是命令——被引号包裹的 token 是字符串/解释性文本
+ * - `#` 开头的注释行整行不是命令；行内未引号 `#` 之后的内容也不是命令
+ * - 段分隔符（&& / || / ; / | / ( ) / > < 等）之后到匹配点之间，只允许
+ *   空白、环境变量赋值链（`VAR=...`）或命令前缀词（sudo 等）；否则 pnpm
+ *   出现在普通字符串/解释性文本中（如 `echo 注意别乱跑 pnpm install`）
+ */
+function isPnpmAtCommandPosition(command: string, matchIndex: number): boolean {
+  const lineStart = command.lastIndexOf('\n', matchIndex - 1) + 1
+  const lineEnd = command.indexOf('\n', matchIndex)
+  const line = command.slice(lineStart, lineEnd === -1 ? command.length : lineEnd)
+  const rel = matchIndex - lineStart
+
+  // 注释行：行首（忽略空白）即 `#`，整行不是命令。
+  if (/^\s*#/.test(line)) return false
+
+  // 引号与内联注释：扫描到匹配点，跟踪单/双引号状态（含转义）。
+  let inSingle = false
+  let inDouble = false
+  for (let i = 0; i < rel; i++) {
+    const c = line[i]
+    if (inSingle) {
+      if (c === "'") inSingle = false
+      continue
+    }
+    if (inDouble) {
+      if (c === '"') inDouble = false
+      else if (c === '\\') i++ // 双引号内转义字符
+      continue
+    }
+    if (c === '\\') { i++; continue }
+    if (c === "'") inSingle = true
+    else if (c === '"') inDouble = true
+    else if (c === '#') return false // 内联注释：pnpm 出现在注释内容里
+  }
+  if (inSingle || inDouble) return false // pnpm 在引号内
+
+  // 命令位置：最后一个段分隔符之后只允许空白 / 赋值链 / 命令前缀词。
+  const head = line.slice(0, rel)
+  const lastSep = Array.from(head.matchAll(/&&|\|\||[;&|()<>]/g)).at(-1)
+  const chunk = lastSep === undefined ? head : head.slice(lastSep.index + lastSep[0].length)
+  const words = chunk.replace(/"[^"]*"|'[^']*'/g, 'X').trim().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return true
+  return words.every(w => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || COMMAND_PREFIX_WORDS.has(w))
+}
+
+/**
  * 解析纯函数：命令串里出现过的全部依赖操作子命令（按出现顺序）。
+ * 逐词扫描前先做命令位置门控：引号内、`#` 注释（行首/内联）中、
+ * 以及解释性文本（非命令位置）里的 pnpm 不参与匹配。
  */
 export function detectPnpmOperations(command: string): string[] {
   const found: string[] = []
   const re = /\b(?:corepack\s+)?pnpm(?:@[^\s]+)?\b/g
   let match: RegExpExecArray | null
   while ((match = re.exec(command)) !== null) {
+    if (!isPnpmAtCommandPosition(command, match.index)) continue
     const after = command.slice(match.index + match[0].length)
     const op = scanPnpmArgs(after)
     if (op !== null) found.push(op)
