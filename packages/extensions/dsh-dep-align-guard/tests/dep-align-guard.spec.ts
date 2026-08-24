@@ -19,6 +19,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import { CallId } from '@deepseek-ai/dsh-llm'
+import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import * as guard from '../src/index.ts'
 
@@ -478,7 +479,7 @@ describe('dsh-dep-align-guard（tools/post-execute 对齐检测）', () => {
       'tools/post-execute',
       exec,
       result,
-      () => Promise.resolve({ kind: 'block' as const, feedback: [{ type: 'text', text: 'downstream blocked' }] }),
+      () => Promise.resolve({ kind: 'block' as const, feedback: [{ type: 'text' as const, text: 'downstream blocked' }] }),
     ) as unknown as Promise<{ kind: string; additionalContexts?: unknown[] }>)
     expect(decision.kind).toBe('block')
     expect((decision as { additionalContexts?: unknown[] }).additionalContexts).toBeUndefined()
@@ -500,12 +501,12 @@ describe('dsh-dep-align-guard（tools/post-execute 对齐检测）', () => {
       signal: new AbortController().signal,
     } as unknown as ToolExecution
     const result = { isError: false, value: { ok: true }, content: [{ type: 'text', text: 'ok' }] } as unknown as ToolExecutionResult
-    const downstreamContext = {
+    const downstreamContext: UserMessage = {
       id: 'downstream-msg',
       role: 'user',
       content: [{ type: 'text', text: 'downstream context' }],
       source: { kind: 'plugin', plugin: 'downstream' },
-    }
+    } as unknown as UserMessage
     const decision = await (ctx.waterfall(
       ctx as never,
       'tools/post-execute',
