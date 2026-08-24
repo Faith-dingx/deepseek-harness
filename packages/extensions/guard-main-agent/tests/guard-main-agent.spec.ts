@@ -232,6 +232,52 @@ describe('guard-main-agent integration (tools/pre-execute)', () => {
     expect(track.code).toBe(1) // only the blocked bash delegated
   })
 
+  it('场景S1: shell hard-block — bash rm denies deterministically, classifier never consulted', async () => {
+    let classifierCalls = 0
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(async () => {
+      classifierCalls += 1
+      // Even an ALLOW verdict must not rescue an rm call (machine-gated rule).
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ verdict: 'allow', reason: 'classifier says ok' }) } }] }), { status: 200 })
+    }, track)
+    const { agent } = agentFor(ws)
+    const { decision, nextCalls } = await preExecute(ctx, agent, 'bash', { command: 'rm -rf /home/dingx/.temp/node_modules/' })
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') expect(decision.reason).toContain('rm 命令')
+    expect(nextCalls).toBe(0)
+    expect(classifierCalls).toBe(0) // bypasses the classifier entirely
+    expect(track.code).toBe(1) // auto-dispatched to the proper toolset (code-agent)
+  })
+
+  it('场景S2: shell hard-block — terminal_send text containing rm is also blocked', async () => {
+    let classifierCalls = 0
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(async () => {
+      classifierCalls += 1
+      return new Response('', { status: 200 })
+    }, track)
+    const { agent } = agentFor(ws)
+    const { decision, nextCalls } = await preExecute(ctx, agent, 'terminal_send', { sessionId: 's1', text: 'cd /x && rm -rf build' })
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') expect(decision.reason).toContain('rm 命令')
+    expect(nextCalls).toBe(0)
+    expect(classifierCalls).toBe(0)
+    expect(track.code).toBe(1)
+  })
+
+  it('场景S3: non-rm shell commands still flow through the classifier path', async () => {
+    let classifierCalls = 0
+    const ctx = await setup(async () => {
+      classifierCalls += 1
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ verdict: 'allow', reason: 'ok' }) } }] }), { status: 200 })
+    })
+    const { agent } = agentFor(ws)
+    const { decision, nextCalls } = await preExecute(ctx, agent, 'bash', { command: 'ls -la' })
+    expect(classifierCalls).toBe(1)
+    expect(decision.kind).toBe('allow')
+    expect(nextCalls).toBe(1)
+  })
+
   it('场景4: task-switch (user message hash change) refreshes the classification cache', async () => {
     let fetches = 0
     const ctx = await setup(async () => {

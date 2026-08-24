@@ -110,6 +110,26 @@ export function isDiagnosticTool(toolName: string): boolean {
 }
 
 /**
+ * Deterministic `rm` invocation detector for shell command text.
+ *
+ * Machine-gated rule (用户指令 2026-08-25): the main agent is FORBIDDEN from
+ * executing `rm` commands. A symlink `rm -rf <link>/` trailing-slash incident
+ * followed the link and wiped a node_modules tree, so even a plain `rm` stays
+ * hard-blocked. Matches a standalone `rm` word at any command boundary (start,
+ * after `; && || | (` newline, or whitespace) with optional `sudo` / `command`
+ * / `env [flags]` prefixes and bare env assignments. The word must END at
+ * whitespace/end-of-text, so flags like docker's `--rm` and names like
+ * `rmdir` / `rm-folder` never match. `git rm` / `docker rm` subcommands are
+ * deliberately covered — they are also destructive deletion commands.
+ */
+export function isRmCommand(command: string): boolean {
+  return RM_COMMAND_RE.test(command)
+}
+
+const RM_COMMAND_RE =
+  /(^|[\s;&|(])(?:(?:sudo|command|env(?:\s+-[A-Za-z0-9_]+)?)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*\\?rm(?=\s|$)/m
+
+/**
  * Tolerant parse of the classifier reply into a {@link ClassifierOutput}.
  *
  * Accepted forms:

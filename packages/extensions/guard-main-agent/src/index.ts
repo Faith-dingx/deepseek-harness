@@ -31,7 +31,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { ClassifyErrorType, ClassifierOutput, GuardPluginConfig, PolicyVerdict, ResolvedGuardConfig } from './types.ts'
 import { classify, summarizeArgs } from './classifier.ts'
-import { DELEGATION_TOOLS, DIAGNOSTIC_TOOLS, WRITE_TOOLS, resolveVerdict } from './policy.ts'
+import { DELEGATION_TOOLS, DIAGNOSTIC_TOOLS, WRITE_TOOLS, isRmCommand, resolveVerdict } from './policy.ts'
 import { createFilePolicy, parsePolicy, type FileDecision, type FilePolicy } from './filePolicy.ts'
 import { buildDenialNotice, delegate, type DelegateDeps, type DelegateOutcome } from './delegate.ts'
 import { TTLMap, cacheKeyString, hashText } from './cache.ts'
@@ -146,6 +146,24 @@ export function apply(ctx: Context, config: Config = {}): void {
       const verdict = filePolicyVerdict(toolName, decision)
       logDecision(ctx, decisionRecord(toolName, verdict.verdict, verdict.reason, verdict.delegateTo), started, decision.allowed ? 'file-allow' : 'file-deny')
       if (decision.allowed) return next()
+      return blockAndDeny(ctx, exec, verdict)
+    }
+    // Shell command hard-block: the main agent is FORBIDDEN from executing
+    // `rm` commands (用户指令 2026-08-25; 软链接 rm -rf 尾斜杠误删 node_modules
+    // 教训 2026-08-25). Machine-gated, not a classifier decision — it bypasses
+    // the classifier and its cache entirely: no context, model availability,
+    // or verdict can rescue an rm call.
+    const shellCommand = extractShellCommand(exec)
+    if (shellCommand !== null && isRmCommand(shellCommand)) {
+      const verdict: PolicyVerdict = {
+        verdict: 'block',
+        reason: 'shell 硬禁: 主 agent 禁止执行 rm 命令（用户指令 2026-08-25）',
+        delegateTo: 'code-agent',
+        reviewPrompt: null,
+        classifierFailed: false,
+        toolName,
+      }
+      logDecision(ctx, decisionRecord(toolName, verdict.verdict, verdict.reason, verdict.delegateTo), started, 'shell-hard-block')
       return blockAndDeny(ctx, exec, verdict)
     }
     return classifyAndDecide(ctx, exec, cache, resolved, next, started)
@@ -306,6 +324,31 @@ function extractWritePath(toolName: string, args: unknown): string | null {
     return first ?? null
   }
   return null
+}
+
+/**
+ * Shell-executing tools whose command text is scanned for the hard-blocked
+ * command family. `terminal_send` forwards its text into a live shell session;
+ * `bash` / `pwsh` run it directly as a command.
+ */
+const SHELL_COMMAND_TOOLS: ReadonlySet<string> = new Set([
+  'bash',
+  'pwsh',
+  'terminal',
+  'terminal_send',
+])
+
+/** Extract the shell command text from a shell tool call (null otherwise). */
+function extractShellCommand(exec: ToolExecution): string | null {
+  const args = exec.arguments
+  if (typeof args !== 'object' || args === null) return null
+  if (!SHELL_COMMAND_TOOLS.has(exec.name)) return null
+  if (exec.name === 'terminal_send') {
+    const text = (args as { text?: unknown }).text
+    return typeof text === 'string' && text.trim() !== '' ? text : null
+  }
+  const command = (args as { command?: unknown }).command
+  return typeof command === 'string' && command.trim() !== '' ? command : null
 }
 
 /** The workspace root for the cache key and policy resolution. */

@@ -7,6 +7,7 @@ import {
   WRITE_TOOLS,
   isDiagnosticTool,
   isReadonlyTool,
+  isRmCommand,
   parseClassifierOutput,
   resolveVerdict,
 } from '../src/policy.ts'
@@ -259,5 +260,51 @@ describe('resolveVerdict — fallback path (classifier failed)', () => {
       expect(verdict.verdict, toolName).toBe('block')
       expect(verdict.classifierFailed).toBe(true)
     }
+  })
+})
+
+describe('isRmCommand (shell hard-block, 用户指令 2026-08-25)', () => {
+  it('matches a plain rm invocation', () => {
+    expect(isRmCommand('rm -rf /tmp/x')).toBe(true)
+    expect(isRmCommand('rm x')).toBe(true)
+    expect(isRmCommand('rm -rf /')).toBe(true)
+    expect(isRmCommand('rm')).toBe(true)
+  })
+
+  it('matches rm after any command separator', () => {
+    expect(isRmCommand('pwd && rm -rf /tmp/x')).toBe(true)
+    expect(isRmCommand('cd /x; rm -f y')).toBe(true)
+    expect(isRmCommand('ls | rm -rf x')).toBe(true)
+    expect(isRmCommand('echo hi\nrm -rf x')).toBe(true)
+    expect(isRmCommand('if true; then rm -rf x; fi')).toBe(true)
+  })
+
+  it('matches rm with sudo / env / command prefixes and bare env assignments', () => {
+    expect(isRmCommand('sudo rm -rf /tmp/x')).toBe(true)
+    expect(isRmCommand('command rm -f x')).toBe(true)
+    expect(isRmCommand('env FOO=1 rm -rf x')).toBe(true)
+    expect(isRmCommand('env -i FOO=1 rm -rf x')).toBe(true)
+    expect(isRmCommand('x=1 rm -rf /tmp')).toBe(true)
+  })
+
+  it('matches rm inside command substitution and after a backslash escape', () => {
+    expect(isRmCommand('$(rm -rf x)')).toBe(true)
+    expect(isRmCommand('\\rm -rf x')).toBe(true)
+  })
+
+  it('deliberately matches destructive subcommands (git rm / docker rm)', () => {
+    expect(isRmCommand('git rm file')).toBe(true)
+    expect(isRmCommand('docker rm -f container')).toBe(true)
+  })
+
+  it('does not match non-rm words, flags, paths, or quoted echoes', () => {
+    expect(isRmCommand('ls -la')).toBe(false)
+    expect(isRmCommand('pwd && mkdir -p build')).toBe(false)
+    expect(isRmCommand('rmdir empty-dir')).toBe(false)
+    expect(isRmCommand('docker run --rm alpine true')).toBe(false)
+    expect(isRmCommand('xrm -rf /tmp')).toBe(false)
+    expect(isRmCommand('mkdir -p rm-folder')).toBe(false)
+    expect(isRmCommand('echo "rm -rf /tmp"')).toBe(false)
+    expect(isRmCommand('')).toBe(false)
   })
 })
