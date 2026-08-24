@@ -67,6 +67,12 @@ minimumReleaseAgeExclude:
   - node-addon-require-builtin-win32-ia32-msvc@0.1.4
   - node-addon-require-builtin-win32-x64-msvc@0.1.4
   - node-addon-require-builtin@0.1.4
+  - '@aws-sdk/core@3.977.9'
+  - '@aws-sdk/nested-clients@3.997.44'
+  - '@aws-sdk/signature-v4-multi-region@3.996.46'
+  - '@aws-sdk/token-providers@3.1116.0'
+  - '@aws-sdk/types@3.974.5'
+  - '@aws-sdk/xml-builder@3.972.40'
 
 patchedDependencies:
   node-pty@1.2.0-beta.15: patches/node-pty@1.2.0-beta.15.patch
