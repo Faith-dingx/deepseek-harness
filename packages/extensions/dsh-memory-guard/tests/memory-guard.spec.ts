@@ -69,6 +69,15 @@ describe('dsh-memory-guard (tools/pre-execute)', () => {
     expect(nextCalls).toBe(0)
   })
 
+  it('拒绝理由不含未转义的裸 {{（Bug1 契约：reason 落盘后不会被二次插值）', async () => {
+    const ctx = await setup()
+    const { kind, reason } = await preExecute(ctx, 'memory_log', { note: '把 {{commit}} 用反引号包住写' })
+    expect(kind).toBe('deny')
+    // 反引号内的 `{{...}}` 是合法转义；反引号之外不允许再出现裸 `{{`。
+    const outside = (reason ?? '').split('`').filter((_, i) => i % 2 === 0)
+    for (const segment of outside) expect(segment).not.toContain('{{')
+  })
+
   it('拒绝: memory_note 含单侧花括号 {{ (不完整模板)', async () => {
     const ctx = await setup()
     const { kind, reason } = await preExecute(ctx, 'memory_note', { action: 'append', content: '模板开始 {{ 后面还有内容' })

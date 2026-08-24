@@ -88,8 +88,22 @@ return {
       const samples = scan.matches.map((m) => JSON.stringify(m)).join(', ')
       const locations = scan.paths.length > 0 ? '参数路径: ' + scan.paths.join('; ') : ''
       const reason = '记忆禁止写 {{xxx}} 字面量 (工具 ' + toolName + ' 检测到: ' + samples + '; ' + locations + ')，请去掉花括号，或需要描述占位符时用反引号包裹（如 `{{commit}}` 而不是裸 {{commit}}）'
+      // 与静态包 buildDenialReason 一致：reason 会传给 LLM 并落盘会话文件，
+      // 必须把所有裸 {{...}} 统一包上反引号，防止守卫拦得住写记忆、reason 本身
+      // 却成为二次污染源（2026-08-24 故障二同源；静态包已修，host 副本曾漂移）。
+      // 只转义反引号之外的 {{...}}（按段奇偶判断），避免模板里已有的
+      // `{{commit}}` 示例被二次包裹。
+      let escapedReason = ''
+      {
+        const parts = reason.split('`')
+        for (let i = 0; i < parts.length; i++) {
+          escapedReason += i % 2 === 1
+            ? '`' + parts[i] + '`'
+            : parts[i].replace(/\{\{[^{}]*\}\}/g, (m) => '`' + m + '`')
+        }
+      }
       console.log('[dsh-memory-guard] deny tool=' + toolName + ' matches=' + JSON.stringify(scan.matches))
-      return { kind: 'deny', reason }
+      return { kind: 'deny', reason: escapedReason }
     })
   },
 }
