@@ -39,3 +39,8 @@ apps/web/dist/
 worktrees/
 .agents/worktrees/
 .typert-*/
+
+# Runtime data directories
+.dsh/
+.dsh-memory/
+.temp/
