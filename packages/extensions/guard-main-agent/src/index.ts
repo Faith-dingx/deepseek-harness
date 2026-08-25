@@ -226,7 +226,7 @@ async function classifyAndDecide(
     }
   }
 
-  const verdict = resolveVerdict({ toolName, output, config: resolved })
+  const verdict = resolveVerdict({ toolName, output, config: resolved, shellCommand: extractShellCommand(exec) })
   logDecision(ctx, decisionRecord(toolName, verdict.verdict, verdict.reason, verdict.delegateTo, failureType), started, cacheHit ? 'classifier-cache-hit' : 'classifier-decision')
   if (verdict.verdict === 'block') return blockAndDeny(ctx, exec, verdict)
   return next()

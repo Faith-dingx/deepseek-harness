@@ -196,12 +196,17 @@ describe('guard-main-agent integration (tools/pre-execute)', () => {
     expect(nextCalls).toBe(1)
   })
 
-  it('场景3: classifier failure -> code-class bash fails close, writes stay whitelisted', async () => {
+  it('场景3: classifier failure -> readonly shell fail-open, write shell still fails close', async () => {
     const track: { code?: number; check?: number } = {}
     const ctx = await setup(async () => { throw new Error('network down') }, track)
     const { agent } = agentFor(ws)
-    const bash = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
-    expect(bash.decision.kind).toBe('deny')
+    // 简单只读诊断命令: 分类器挂时 fail-open, 不派发 (P2 Task 2).
+    const status = await preExecute(ctx, agent, 'bash', { command: 'git status' })
+    expect(status.decision.kind).toBe('allow')
+    expect(status.nextCalls).toBe(1)
+    // 写 shell 命令: 仍 fail-close + 派发 code-agent.
+    const push = await preExecute(ctx, agent, 'bash', { command: 'git push origin main' })
+    expect(push.decision.kind).toBe('deny')
     expect(track.code).toBe(1)
     // A whitelisted doc write still passes even though the classifier is down
     // (the file gate is deterministic and runs first).
@@ -384,6 +389,39 @@ describe('guard-main-agent file policy integration (v2.1 whitelist + fail-close)
   })
 })
 
+describe('readonly shell fail-open integration (P2 Task 2, classifier down)', () => {
+  it('场景R1: bash git status is allowed without delegation when the classifier throws', async () => {
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(async () => { throw new Error('network down') }, track)
+    const { agent } = agentFor(ws)
+    const { decision, nextCalls } = await preExecute(ctx, agent, 'bash', { command: 'git status' })
+    expect(decision.kind).toBe('allow')
+    expect(nextCalls).toBe(1)
+    expect(track.code).toBeUndefined()
+  })
+
+  it('场景R2: bash git push origin main is denied and dispatches code-agent', async () => {
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(async () => { throw new Error('network down') }, track)
+    const { agent } = agentFor(ws)
+    const { decision, nextCalls } = await preExecute(ctx, agent, 'bash', { command: 'git push origin main' })
+    expect(decision.kind).toBe('deny')
+    expect(nextCalls).toBe(0)
+    expect(track.code).toBe(1)
+  })
+
+  it('场景R3: rm hard-block still wins over the fail-open path (classifier down)', async () => {
+    const track: { code?: number; check?: number } = {}
+    const ctx = await setup(async () => { throw new Error('network down') }, track)
+    const { agent } = agentFor(ws)
+    const { decision, nextCalls } = await preExecute(ctx, agent, 'bash', { command: 'rm -rf /tmp/x' })
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') expect(decision.reason).toContain('rm')
+    expect(nextCalls).toBe(0)
+    expect(track.code).toBe(1)
+  })
+})
+
 describe('classifier timeout jitter regression (计划-guard误拦修复 T5)', () => {
   /** Fetch stub that never settles on its own but rejects when its signal aborts. */
   function abortAwareNever(): (input: string, init: RequestInit) => Promise<Response> {
@@ -421,58 +459,64 @@ describe('classifier timeout jitter regression (计划-guard误拦修复 T5)', (
     }
   })
 
-  it('场景F: a real failure (network error) still fails close, no delegation of intent', async () => {
+  it('场景F: a real network failure opens for a readonly shell command, closes for a write command', async () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('network down'))
     const track: { code?: number; check?: number } = {}
     const ctx = await setup(fetchMock, track)
     const { agent } = agentFor(ws)
-    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
-    expect(decision.kind).toBe('deny')
+    // Readonly shell command fail-opens (P2 Task 2): no delegation, tool runs.
+    const status = await preExecute(ctx, agent, 'bash', { command: 'git status' })
+    expect(status.decision.kind).toBe('allow')
+    expect(status.nextCalls).toBe(1)
     expect(fetchMock).toHaveBeenCalledTimes(1) // fatal -> no retry
-    expect(track.code).toBe(1) // fail-close delegates to code-agent
+    // A write shell command still fails close on the same outage.
+    const push = await preExecute(ctx, agent, 'bash', { command: 'git push origin main' })
+    expect(push.decision.kind).toBe('deny')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(track.code).toBe(1) // only the write command delegates to code-agent
   })
 
-  it('场景G: HTTP 500 fails close without retry', async () => {
+  it('场景G: HTTP 500 fails close without retry (write shell command)', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('boom', { status: 500 }))
     const track: { code?: number; check?: number } = {}
     const ctx = await setup(fetchMock, track)
     const { agent } = agentFor(ws)
-    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'git push origin main' })
     expect(decision.kind).toBe('deny')
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(track.code).toBe(1)
   })
 
-  it('场景G+: HTTP 429 fails close without retry', async () => {
+  it('场景G+: HTTP 429 fails close without retry (write shell command)', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('too many requests', { status: 429 }))
     const track: { code?: number; check?: number } = {}
     const ctx = await setup(fetchMock, track)
     const { agent } = agentFor(ws)
-    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'git push origin main' })
     expect(decision.kind).toBe('deny')
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(track.code).toBe(1)
   })
 
-  it('场景G+: HTTP 400 fails close without retry', async () => {
+  it('场景G+: HTTP 400 fails close without retry (write shell command)', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('bad request', { status: 400 }))
     const track: { code?: number; check?: number } = {}
     const ctx = await setup(fetchMock, track)
     const { agent } = agentFor(ws)
-    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' })
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'git push origin main' })
     expect(decision.kind).toBe('deny')
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(track.code).toBe(1)
   })
 
-  it('场景H: a caller abort is a hard stop -> fetch never called, bash fails close', async () => {
+  it('场景H: a caller abort is a hard stop -> fetch never called, write shell fails close', async () => {
     const controller = new AbortController()
     controller.abort()
     const fetchMock = vi.fn()
     const track: { code?: number; check?: number } = {}
     const ctx = await setup(fetchMock, track)
     const { agent } = agentFor(ws)
-    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'pwd' }, controller.signal)
+    const { decision } = await preExecute(ctx, agent, 'bash', { command: 'git push origin main' }, controller.signal)
     expect(fetchMock).toHaveBeenCalledTimes(0) // abort detected at the classify() entry
     expect(decision.kind).toBe('deny') // caller abort is fatal -> fail-close
     // The caller cancelled the turn, so the delegation channel is cancelled too

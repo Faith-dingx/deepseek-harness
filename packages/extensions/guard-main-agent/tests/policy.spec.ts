@@ -7,6 +7,7 @@ import {
   WRITE_TOOLS,
   isDiagnosticTool,
   isReadonlyTool,
+  isReadonlyShellCommand,
   isRmCommand,
   parseClassifierOutput,
   resolveVerdict,
@@ -306,5 +307,139 @@ describe('isRmCommand (shell hard-block, 用户指令 2026-08-25)', () => {
     expect(isRmCommand('mkdir -p rm-folder')).toBe(false)
     expect(isRmCommand('echo "rm -rf /tmp"')).toBe(false)
     expect(isRmCommand('')).toBe(false)
+  })
+})
+
+describe('isReadonlyShellCommand (classifier-down shell fail-open)', () => {
+  it('treats git read subcommands as readonly', () => {
+    for (const cmd of [
+      'git status', 'git log --oneline -5', 'git diff HEAD~1', 'git show abc123',
+      'git rev-parse HEAD', 'git cat-file -p HEAD', 'git blame src/a.ts',
+      'git branch -a', 'git tag -l', 'git remote -v', 'git fetch origin', 'git ls-files',
+    ]) {
+      expect(isReadonlyShellCommand(cmd), cmd).toBe(true)
+    }
+  })
+
+  it('treats git write subcommands as NOT readonly', () => {
+    for (const cmd of [
+      'git push origin main', 'git commit -m x', 'git checkout -b feat', 'git reset --hard HEAD',
+      'git merge main', 'git clean -fd', 'git rebase main', 'git switch -c x', 'git rm file',
+    ]) {
+      expect(isReadonlyShellCommand(cmd), cmd).toBe(false)
+    }
+  })
+
+  it('treats deterministic single commands as readonly', () => {
+    for (const cmd of [
+      'ls -la', 'find . -name "*.ts"', 'df -h', 'free -m', 'ps aux', 'top -b -n 1',
+      'head -5 file', 'tail -f /var/log/x', 'cat package.json', 'stat file', 'file bin',
+      'wc -l file', 'which node', 'uname -a', 'echo hi', 'env', 'printenv PATH', 'type ls',
+    ]) {
+      expect(isReadonlyShellCommand(cmd), cmd).toBe(true)
+    }
+  })
+
+  it('curl: plain GET / HEAD probes are readonly', () => {
+    expect(isReadonlyShellCommand('curl http://x')).toBe(true)
+    expect(isReadonlyShellCommand('curl -I http://x')).toBe(true)
+    expect(isReadonlyShellCommand('curl -sS -I http://x')).toBe(true)
+    expect(isReadonlyShellCommand('curl -X GET http://x')).toBe(true)
+    expect(isReadonlyShellCommand('curl --request HEAD http://x')).toBe(true)
+  })
+
+  it('curl: request/data/upload/output flags are NOT readonly', () => {
+    expect(isReadonlyShellCommand('curl -X POST http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl --request PUT http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl -d "a=1" http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl --data-binary @f http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl --data-urlencode "a=1" http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl -F "file=@x" http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl --form "file=@x" http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl -T file http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl --upload-file f http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl -o out.html http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl --output out.html http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl -O http://x')).toBe(false)
+    expect(isReadonlyShellCommand('curl --create-dirs -o a/b http://x')).toBe(false)
+  })
+
+  it('wget: spider and stdout/devnull output are readonly, default download is NOT', () => {
+    expect(isReadonlyShellCommand('wget --spider http://x')).toBe(true)
+    expect(isReadonlyShellCommand('wget -O - http://x')).toBe(true)
+    expect(isReadonlyShellCommand('wget -O /dev/null http://x')).toBe(true)
+    expect(isReadonlyShellCommand('wget --post-data "a=1" http://x')).toBe(false)
+    expect(isReadonlyShellCommand('wget --post-file body.txt http://x')).toBe(false)
+    expect(isReadonlyShellCommand('wget --method POST http://x')).toBe(false)
+    expect(isReadonlyShellCommand('wget -O out.html http://x')).toBe(false)
+    expect(isReadonlyShellCommand('wget http://x')).toBe(false)
+  })
+
+  it('shell metacharacters (pipes, substitution, separators, redirection) are NEVER readonly', () => {
+    expect(isReadonlyShellCommand('cat x | sh')).toBe(false)
+    expect(isReadonlyShellCommand('ls | tee f')).toBe(false)
+    expect(isReadonlyShellCommand('git status; git push')).toBe(false)
+    expect(isReadonlyShellCommand('git status && git push')).toBe(false)
+    expect(isReadonlyShellCommand('$(curl http://x)')).toBe(false)
+    expect(isReadonlyShellCommand('`ls`')).toBe(false)
+    expect(isReadonlyShellCommand('ls > out.txt')).toBe(false)
+    expect(isReadonlyShellCommand('cat <(echo hi)')).toBe(false)
+  })
+
+  it('strips sudo / command / env prefixes before judging', () => {
+    expect(isReadonlyShellCommand('sudo ls -la')).toBe(true)
+    expect(isReadonlyShellCommand('command git status')).toBe(true)
+    expect(isReadonlyShellCommand('sudo git push')).toBe(false)
+    expect(isReadonlyShellCommand('sudo curl -X POST http://x')).toBe(false)
+  })
+
+  it('empty / unknown / bare commands are NOT readonly (fail closed)', () => {
+    expect(isReadonlyShellCommand('')).toBe(false)
+    expect(isReadonlyShellCommand('   ')).toBe(false)
+    expect(isReadonlyShellCommand('some-unknown-cmd --flag')).toBe(false)
+    expect(isReadonlyShellCommand('git')).toBe(false)
+    expect(isReadonlyShellCommand('git -C /x')).toBe(false)
+  })
+})
+
+describe('resolveVerdict — readonly shell fail-open (classifier down)', () => {
+  const failedWithShell = (toolName: string, shellCommand: string): ReturnType<typeof resolveVerdict> =>
+    resolveVerdict({ toolName, output: null, config: config(), shellCommand })
+
+  it('classifier down + bash git status -> allow, no delegation', () => {
+    const verdict = failedWithShell('bash', 'git status')
+    expect(verdict.verdict).toBe('allow')
+    expect(verdict.delegateTo).toBeNull()
+    expect(verdict.classifierFailed).toBe(true)
+    expect(verdict.reason).toContain('readonly shell')
+  })
+
+  it('classifier down + bash git push -> block and delegate to code-agent', () => {
+    const verdict = failedWithShell('bash', 'git push origin main')
+    expect(verdict.verdict).toBe('block')
+    expect(verdict.delegateTo).toBe('code-agent')
+    expect(verdict.reason).toContain('fails close')
+  })
+
+  it('classifier down + terminal ls -> allow', () => {
+    const verdict = failedWithShell('terminal', 'ls -la')
+    expect(verdict.verdict).toBe('allow')
+  })
+
+  it('pwsh is NOT fail-opened even for a bash-readonly command text (documented boundary)', () => {
+    const verdict = failedWithShell('pwsh', 'ls -la')
+    expect(verdict.verdict).toBe('block')
+    expect(verdict.delegateTo).toBe('code-agent')
+  })
+
+  it('tool-cordis is never fail-opened (inspect tools already ride the READONLY/DIAGNOSTIC paths)', () => {
+    const verdict = failedWithShell('tool-cordis', 'git status')
+    expect(verdict.verdict).toBe('block')
+  })
+
+  it('missing shellCommand keeps the existing code-class fail-close', () => {
+    const verdict = resolveVerdict({ toolName: 'bash', output: null, config: config() })
+    expect(verdict.verdict).toBe('block')
+    expect(verdict.delegateTo).toBe('code-agent')
   })
 })

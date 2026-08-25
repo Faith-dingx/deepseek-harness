@@ -130,6 +130,79 @@ const RM_COMMAND_RE =
   /(^|[\s;&|(])(?:(?:sudo|command|env(?:\s+-[A-Za-z0-9_]+)?)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*\\?rm(?=\s|$)/m
 
 /**
+ * Shell tools eligible for the readonly fail-open branch. Subset of
+ * CODE_CLASS_TOOLS; pwsh and tool-cordis are intentionally absent.
+ */
+const READONLY_SHELL_TOOLS: ReadonlySet<string> = new Set(['bash', 'terminal'])
+
+/**
+ * Deterministic readonly-shell judgment for the classifier-down fail-open
+ * branch (P2 主 agent 工具面收敛 Task 2, 评审 H1/H2/M2/M3/L1/L2/L3).
+ *
+ * Sub-command/flag-level, never first-word only: `git push` must NOT be
+ * mistaken for readonly just because the first word is `git`, and `curl -X
+ * POST` must NOT pass because `curl` is a network probe. Anything ambiguous,
+ * composed, or unknown fails closed (returns false), so the only commands
+ * opened here are deterministically read-only diagnostics.
+ */
+export function isReadonlyShellCommand(command: string): boolean {
+  if (command.trim() === '') return false
+  // Shell metacharacters compose pipelines, command substitution, separators,
+  // or redirection; they defeat sub-command-level judgment (评审 M3), so the
+  // whole command is treated as NOT readonly. Note `>>` is covered by `>`, and
+  // `<(` (process substitution) is matched literally while a plain `< file`
+  // input redirect stays untouched (input redirect is itself read-only).
+  if (/[|;`]|&&|\|\||\$\(|>>|>|<\(/.test(command)) return false
+
+  // Strip leading sudo / command / env [flags] prefixes (first word only).
+  let rest = command.trim()
+  for (;;) {
+    const stripped = rest.replace(/^(?:sudo|command|env(?:\s+-[A-Za-z0-9_]+)?)\s+/, '')
+    if (stripped === rest) break
+    rest = stripped
+  }
+  const words = rest.split(/\s+/).filter(word => word !== '')
+  const first = words[0]
+  if (first === undefined) return false
+
+  if (first === 'git') {
+    // git <sub>: only the read-only subcommands qualify (评审 H1).
+    const sub = words[1]
+    return sub !== undefined && READONLY_GIT_SUBCOMMANDS.has(sub)
+  }
+  if (first === 'curl') {
+    // Write/data/upload/download flags disqualify the whole call (评审 H1/M2).
+    if (/--data|--form|--upload-file|--output|--create-dirs|(?:^|\s)-[dFToO](?=\s|$)/.test(rest)) return false
+    // -X/--request with a method other than GET/HEAD also disqualifies.
+    const method = /(?:-X|--request)\s*([A-Za-z]+)/.exec(rest)
+    if (method?.[1] !== undefined && !['GET', 'HEAD'].includes(method[1].toUpperCase())) return false
+    return true
+  }
+  if (first === 'wget') {
+    if (/--post-data|--post-file|--method/.test(rest)) return false
+    // Only --spider, or explicit stdout //dev/null output, stay readonly; the
+    // default wget download writes a file (评审 M2).
+    if (/\s--spider\b/.test(rest)) return true
+    const output = /(?:^|\s)-O\s+(\S+)/.exec(rest)
+    if (output?.[1] !== undefined && (output[1] === '-' || output[1] === '/dev/null')) return true
+    return false
+  }
+  return READONLY_SINGLE_COMMANDS.has(first)
+}
+
+/** git subcommands that only read repository state. */
+const READONLY_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'status', 'log', 'diff', 'show', 'rev-parse', 'cat-file', 'blame',
+  'branch', 'tag', 'remote', 'fetch', 'ls-files', 'ls-tree',
+])
+
+/** Deterministic single commands with read-only output. */
+const READONLY_SINGLE_COMMANDS: ReadonlySet<string> = new Set([
+  'ls', 'find', 'stat', 'file', 'wc', 'head', 'tail', 'cat', 'ps', 'top',
+  'df', 'free', 'uname', 'which', 'type', 'echo', 'env', 'printenv',
+])
+
+/**
  * Tolerant parse of the classifier reply into a {@link ClassifierOutput}.
  *
  * Accepted forms:
@@ -188,6 +261,8 @@ export interface VerdictInput {
   /** Parsed classifier output; null when the classifier failed or was unreadable. */
   readonly output: ClassifierOutput | null
   readonly config: Pick<ResolvedGuardConfig, 'fallback' | 'diagnosticFallback'>
+  /** Shell command text for code-class shell tools (null for non-shell tools). */
+  readonly shellCommand?: string | null
 }
 
 /**
@@ -232,6 +307,30 @@ export function resolveVerdict(input: VerdictInput): PolicyVerdict {
     return {
       verdict: mode === 'open' ? 'allow' : 'block',
       reason: `classifier unavailable; diagnosticFallback=${mode}`,
+      delegateTo: null,
+      reviewPrompt: null,
+      classifierFailed: true,
+      toolName,
+    }
+  }
+  // Readonly shell fail-open (评审 H1/H2/L1): when the classifier is down, a
+  // deterministically-readonly shell command (git status / ls / curl -I ...)
+  // keeps the main agent's simple diagnostics alive instead of closing the
+  // entire code-class family. The check is sub-command/flag-level only; rm was
+  // already hard-blocked upstream and anything ambiguous still fails close.
+  // Restricted to the explicit bash/terminal pair: pwsh is excluded (different
+  // shell grammar, interactive by default) and tool-cordis is excluded (it
+  // never carries a shell command; its read-only inspect tools already ride
+  // the READONLY/DIAGNOSTIC paths) — documented boundaries.
+  if (
+    READONLY_SHELL_TOOLS.has(toolName)
+    && typeof input.shellCommand === 'string'
+    && input.shellCommand.trim() !== ''
+    && isReadonlyShellCommand(input.shellCommand)
+  ) {
+    return {
+      verdict: 'allow',
+      reason: 'classifier unavailable; readonly shell command fail-open',
       delegateTo: null,
       reviewPrompt: null,
       classifierFailed: true,
