@@ -45,6 +45,7 @@ function loadHostPlugin(): { name: string; apply: (ctx: HostCtx, config?: Record
   expect(body.startsWith('return {')).toBe(true)
   // 直接 new Function 整个 body（body 以 `return {` 开头）。
   // 注意不能用模板字符串包裹——host.js 内容本身含反引号会截断模板。
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval, @typescript-eslint/no-unsafe-call -- 故意执行测试夹具代码
   return new Function(body)() as never
 }
 

@@ -43,7 +43,7 @@ export function resolveConfig(raw: RawConfig = {}, logger?: GuardLogger): GuardC
   if (
     typeof out.maxConcurrent !== 'number'
     || !Number.isInteger(out.maxConcurrent)
-    || (out.maxConcurrent as number) < 1
+    || out.maxConcurrent < 1
   ) {
     if (out.maxConcurrent !== undefined) {
       logger?.warn(`[subagent-guard] maxConcurrent=${out.maxConcurrent} 越界，回退默认 ${DEFAULTS.maxConcurrent}`)
@@ -53,7 +53,7 @@ export function resolveConfig(raw: RawConfig = {}, logger?: GuardLogger): GuardC
   if (
     typeof out.idleTimeoutMs !== 'number'
     || !Number.isInteger(out.idleTimeoutMs)
-    || (out.idleTimeoutMs as number) < 1000
+    || out.idleTimeoutMs < 1000
   ) {
     if (out.idleTimeoutMs !== undefined) {
       logger?.warn(`[subagent-guard] idleTimeoutMs=${out.idleTimeoutMs} 越界，回退默认 ${DEFAULTS.idleTimeoutMs}`)
@@ -63,7 +63,7 @@ export function resolveConfig(raw: RawConfig = {}, logger?: GuardLogger): GuardC
   if (
     typeof out.idlePollMs !== 'number'
     || !Number.isInteger(out.idlePollMs)
-    || (out.idlePollMs as number) < 1000
+    || out.idlePollMs < 1000
   ) {
     if (out.idlePollMs !== undefined) {
       logger?.warn(`[subagent-guard] idlePollMs=${out.idlePollMs} 越界，回退默认 ${DEFAULTS.idlePollMs}`)
@@ -74,5 +74,5 @@ export function resolveConfig(raw: RawConfig = {}, logger?: GuardLogger): GuardC
     out.enabled = DEFAULTS.enabled
   }
 
-  return Config(out) as GuardConfig
+  return Config(out)
 }

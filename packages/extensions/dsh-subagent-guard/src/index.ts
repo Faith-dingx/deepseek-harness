@@ -40,6 +40,7 @@ export function apply(ctx: Context, rawConfig: RawConfig = {}): void | (() => vo
   // H5: bind the original start BEFORE the re-entrancy check so a rejected
   // re-apply can never capture an already-wrapped implementation. Keep the
   // unbound reference too, so the disposer restores the exact original start.
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- 有意：disposer 需用未绑定原引用恢复 start，调用走下方 bind 版
   const originalUnbound = ctx.subagents.start
   const originalStart = originalUnbound.bind(ctx.subagents)
 
@@ -131,7 +132,7 @@ export function apply(ctx: Context, rawConfig: RawConfig = {}): void | (() => vo
           }
         }
       } catch (e) {
-        ctx.logger.warn(`[subagent-guard] 空闲检测异常: ${e}`)
+        ctx.logger.warn(`[subagent-guard] 空闲检测异常: ${String(e)}`)
         // fail-open: never kill on watchdog failure.
       }
     }
