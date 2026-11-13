@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AttachmentId, ImageVariantId } from '@deepseek-ai/dsh-attachment'
-import type { AttachmentStore, ImageAttachmentRef, ImageRequestPolicy, RequestImageAttachment } from '@deepseek-ai/dsh-attachment'
-import { createUserMessage, CallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, createMessage } from '@deepseek-ai/dsh-llm'
+import type { AttachmentStore, ImageAttachmentRef, ImageRequestTarget, RequestImageAttachment } from '@deepseek-ai/dsh-attachment'
+import { createToolResultMessage, createUserMessage, ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, createMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AssistantMessage, AssistantMessageEvent, Usage } from '@earendil-works/pi-ai'
+import { transformMessages } from '@earendil-works/pi-ai/api/transform-messages'
+import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { toPiContext } from '../src/context.ts'
 import { toPiReplayState } from '../src/replay.ts'
 import { mapStopReason, mapUsage, toStreamChunks } from '../src/stream.ts'
@@ -60,10 +62,14 @@ function requestVersion(ref: ImageAttachmentRef): RequestImageAttachment {
 
 function attachmentStore(readImageRequest: (
   ref: ImageAttachmentRef,
-  policy: ImageRequestPolicy,
+  policy: ImageRequestTarget,
   signal?: AbortSignal,
 ) => Promise<RequestImageAttachment>): AttachmentStore {
-  return { readImageRequest } as unknown as AttachmentStore
+  return { readImageRequest, imageHostPath: () => undefined } as unknown as AttachmentStore
+}
+
+function imageContext(attachments: AttachmentStore) {
+  return { attachments, resolveImageAccess: () => undefined }
 }
 
 describe('toPiContext', () => {
@@ -74,21 +80,20 @@ describe('toPiContext', () => {
       system: 'be helpful',
       messages: [createUserMessage({
         content: [{ type: 'text', text: 'hi' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       })],
       tools: [{ name: 'f', description: 'F', parameters: { type: 'object', properties: {} } }],
     })
-    expect(context.systemPrompt).toBe('be helpful')
-    expect(context.messages).toEqual([{ role: 'user', content: 'hi', timestamp: 0 }])
-    expect(context.tools).toEqual([
-      { name: 'f', description: 'F', parameters: { type: 'object', properties: {} } },
-    ])
+    expect(context).toEqual({
+      systemPrompt: 'be helpful',
+      tools: [{ name: 'f', description: 'F', parameters: { type: 'object', properties: {} } }],
+      messages: [{ role: 'user', content: 'hi', timestamp: 0 }],
+    })
   })
 
   it('omits empty tools and absent system prompt', () => {
     const context = toPiContext({ provider: 'deepseek', model: 'm', messages: [], tools: [] })
-    expect(context.systemPrompt).toBeUndefined()
-    expect(context.tools).toBeUndefined()
+    expect(context).toEqual({ messages: [] })
   })
 
   it('resolves durable image references into native pi-ai image content', async () => {
@@ -99,7 +104,7 @@ describe('toPiContext', () => {
       width: 1,
       height: 1,
     }
-    const readImageRequest = vi.fn((value: ImageAttachmentRef, _policy: ImageRequestPolicy) => (
+    const readImageRequest = vi.fn((value: ImageAttachmentRef, _target: ImageRequestTarget) => (
       Promise.resolve(requestVersion(value))
     ))
     const context = await toPiContext({
@@ -107,13 +112,13 @@ describe('toPiContext', () => {
       model: 'gpt-4.1',
       messages: [createUserMessage({
         content: [{ type: 'text', text: 'describe' }, { type: 'image', attachment }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       })],
-    }, attachmentStore(readImageRequest))
+    }, imageContext(attachmentStore(readImageRequest)))
 
     expect(readImageRequest).toHaveBeenCalledWith(
       attachment,
-      { maxPixels: 2048 * 2048, maxBytes: 1024 * 1024 },
+      { width: 1, height: 1, maxBytes: 1024 * 1024 },
       undefined,
     )
     expect(context.messages[0]).toEqual({
@@ -127,7 +132,7 @@ describe('toPiContext', () => {
     })
   })
 
-  it('flattens nested tool-result images into the enclosing result', async () => {
+  it('converts a tool message with text and images on the image path', async () => {
     const attachment = {
       attachmentId: AttachmentId(`sha256:${'c'.repeat(64)}`),
       mediaType: 'image/png' as const,
@@ -135,33 +140,23 @@ describe('toPiContext', () => {
       width: 1,
       height: 1,
     }
-    const readImageRequest = vi.fn((value: ImageAttachmentRef, _policy: ImageRequestPolicy) => (
+    const readImageRequest = vi.fn((value: ImageAttachmentRef, _target: ImageRequestTarget) => (
       Promise.resolve(requestVersion(value))
     ))
     const context = await toPiContext({
       provider: 'openai',
       model: 'gpt-4.1',
-      messages: [createUserMessage({
-        content: [{
-          type: 'tool-result',
-          toolCallId: CallId('outer'),
-          content: [
-            { type: 'tool-result', toolCallId: CallId('empty'), content: [] },
-            { type: 'text', text: 'before' },
-            { type: 'tool-result', toolCallId: CallId('text'), content: [{ type: 'text', text: 'middle' }] },
-            {
-              type: 'tool-result',
-              toolCallId: CallId('inner'),
-              content: [
-                { type: 'image', attachment },
-                { type: 'text', text: 'after' },
-              ],
-            },
-          ],
-        }],
-        source: { kind: 'plugin', plugin: 'test' },
+      messages: [createToolResultMessage({
+        callId: ToolCallId('outer'),
+        content: [
+          { type: 'text', text: 'before' },
+          { type: 'text', text: 'middle' },
+          { type: 'image', attachment },
+          { type: 'text', text: 'after' },
+        ],
+        isError: false,
       })],
-    }, attachmentStore(readImageRequest))
+    }, imageContext(attachmentStore(readImageRequest)))
 
     expect(context.messages).toEqual([{
       role: 'toolResult',
@@ -190,7 +185,7 @@ describe('toPiContext', () => {
             mediaType: 'image/png', bytes: 1, width: 1, height: 1,
           },
         }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       })],
     })).toThrow(expect.objectContaining({ code: 'UNSUPPORTED_CONTENT' }))
   })
@@ -204,9 +199,9 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'hmm' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'model', provider: 'deepseek', model: 'm' },
       })],
     })
     const message = context.messages[0] as AssistantMessage
@@ -225,7 +220,7 @@ describe('toPiContext', () => {
       model: 'm',
       messages: [createMessage({
         role: 'assistant', content: [{ type: 'text', text: 'done' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'model', provider: 'deepseek', model: 'm' },
       })],
     })
     expect((context.messages[0] as AssistantMessage).stopReason).toBe('stop')
@@ -255,8 +250,8 @@ describe('toPiContext', () => {
       model: 'm',
       messages: [createMessage({
         role: 'assistant',
-        content: [{ type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{broken' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{broken' }],
+        source: { kind: 'model', provider: 'deepseek', model: 'm' },
       })],
     })
     const message = context.messages[0] as AssistantMessage
@@ -269,8 +264,8 @@ describe('toPiContext', () => {
       model: 'm',
       messages: [createMessage({
         role: 'assistant',
-        content: [{ type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '[1,2]' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '[1,2]' }],
+        source: { kind: 'model', provider: 'deepseek', model: 'm' },
       })],
     })
     expect((context.messages[0] as AssistantMessage).content[0]).toMatchObject({ arguments: {} })
@@ -283,20 +278,17 @@ describe('toPiContext', () => {
       messages: [
         createMessage({
           role: 'assistant',
-          content: [{ type: 'tool-call', id: CallId('c1'), name: 'get_weather', arguments: '{}' }],
-          source: { kind: 'plugin', plugin: 'test' },
+          content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'get_weather', arguments: '{}' }],
+          source: { kind: 'model', provider: 'deepseek', model: 'm' },
         }),
-        createUserMessage({
-          content: [{
-            type: 'tool-result',
-            toolCallId: CallId('c1'),
-            content: [
-              { type: 'text', text: 'Sunny' },
-              { type: 'tool-result', toolCallId: CallId('nested'), content: [{ type: 'text', text: '!' }] },
-              { type: 'chart', data: 'ignored' } as unknown as ContentBlock,
-            ],
-          }],
-          source: { kind: 'plugin', plugin: 'test' },
+        createToolResultMessage({
+          callId: ToolCallId('c1'),
+          content: [
+            { type: 'text', text: 'Sunny' },
+            { type: 'text', text: '!' },
+            { type: 'chart', data: 'ignored' } as unknown as ContentBlock,
+          ],
+          isError: false,
         }),
       ],
     })
@@ -314,10 +306,7 @@ describe('toPiContext', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [createUserMessage({
-        content: [{ type: 'tool-result', toolCallId: CallId('zz'), content: [], isError: true }],
-        source: { kind: 'plugin', plugin: 'test' },
-      })],
+      messages: [createToolResultMessage({ callId: ToolCallId('zz'), content: [], isError: true })],
     })
     expect(context.messages[0]).toMatchObject({
       role: 'toolResult',
@@ -327,25 +316,28 @@ describe('toPiContext', () => {
     })
   })
 
-  it('splits mixed user text + tool results and folds history system messages', () => {
+  it('preserves the leading system message ahead of user text and tool results', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
       messages: [
         createMessage({
           role: 'system', content: [{ type: 'text', text: 'rule' }],
-          source: { kind: 'plugin', plugin: 'test' },
+          source: { kind: 'system-prompt' },
         }),
         createUserMessage({
-          content: [
-            { type: 'text', text: 'note' },
-            { type: 'tool-result', toolCallId: CallId('c1'), content: [{ type: 'text', text: 'ok' }] },
-          ],
-          source: { kind: 'plugin', plugin: 'test' },
+          content: [{ type: 'text', text: 'note' }],
+          source: { kind: 'model', provider: 'deepseek', model: 'm' },
+        }),
+        createToolResultMessage({
+          callId: ToolCallId('c1'),
+          content: [{ type: 'text', text: 'ok' }],
+          isError: false,
         }),
       ],
     })
-    expect(context.messages.map(message => message.role)).toEqual(['user', 'user', 'toolResult'])
+    expect(context.systemPrompt).toBe('rule')
+    expect(context.messages.map(message => message.role)).toEqual(['user', 'toolResult'])
   })
 
   it('skips plugin-added (unknown) blocks in assistant content', () => {
@@ -358,7 +350,7 @@ describe('toPiContext', () => {
           { type: 'chart', data: 'x' } as unknown as ContentBlock,
           { type: 'text', text: 'visible' },
         ],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'model', provider: 'deepseek', model: 'm' },
       })],
     })
     expect((context.messages[0] as AssistantMessage).content).toEqual([{ type: 'text', text: 'visible' }])
@@ -375,7 +367,7 @@ describe('toPiContext', () => {
       content: [
         { type: 'thinking', thinking: 'private reasoning', thinkingSignature: 'think-sig', redacted: true },
         { type: 'text', text: 'calling', textSignature: 'text-sig' },
-        { type: 'toolCall', id: 'c1', name: 'f', arguments: { a: 1 }, thoughtSignature: 'tool-sig' },
+        { type: 'toolCall', id: 'c1', name: 'f', arguments: { a: 1 }, thoughtSignature: 'tool-sig', namespace: 'functions' },
       ],
     }))
     const context = toPiContext({
@@ -386,7 +378,7 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'private reasoning' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
         source: {
           kind: 'model',
@@ -406,8 +398,74 @@ describe('toPiContext', () => {
       content: [
         { type: 'thinking', thinking: 'private reasoning', thinkingSignature: 'think-sig', redacted: true },
         { type: 'text', text: 'calling', textSignature: 'text-sig' },
-        { type: 'toolCall', id: 'c1', name: 'f', arguments: { a: 1 }, thoughtSignature: 'tool-sig' },
+        { type: 'toolCall', id: 'c1', name: 'f', arguments: { a: 1 }, thoughtSignature: 'tool-sig', namespace: 'functions' },
       ],
+    })
+  })
+
+  it.each(['high', ''])('preserves provider thinking level %j through durable projection and replay', (providerThinkingLevel) => {
+    const state = toPiReplayState(assistant({
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+      providerThinkingLevel,
+      content: [{ type: 'text', text: 'done' }],
+    }))
+    expect(state).toEqual({
+      response: {
+        kind: 'pi-ai',
+        version: 2,
+        api: 'anthropic-messages',
+        provider: 'anthropic',
+        model: 'claude-opus-5',
+        providerThinkingLevel,
+        stopReason: 'stop',
+      },
+      blocks: [{ type: 'text' }],
+    })
+    const replayState: unknown = JSON.parse(JSON.stringify(state))
+    const onDegrade = vi.fn()
+    const context = toPiContext({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+      messages: [createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'done' }],
+        source: { kind: 'model', provider: 'anthropic', model: 'claude-opus-5', replayState },
+      })],
+    }, undefined, onDegrade)
+    expect(context.messages[0]).toMatchObject({
+      api: 'anthropic-messages',
+      providerThinkingLevel,
+      content: [{ type: 'text', text: 'done' }],
+    })
+    expect(onDegrade).not.toHaveBeenCalled()
+  })
+
+  it('replays saved v2 Anthropic alias metadata with the requested model and signed thinking', () => {
+    const requestedModel = 'claude-haiku-4-5'
+    const responseModel = 'claude-haiku-4-5-20251001'
+    const replayState = {
+      response: {
+        kind: 'pi-ai', version: 2, api: 'anthropic-messages', provider: 'anthropic',
+        model: requestedModel, responseModel, stopReason: 'stop',
+      },
+      blocks: [{ type: 'reasoning', thinkingSignature: 'saved-signature' }],
+    }
+    const onDegrade = vi.fn()
+    const context = toPiContext({
+      provider: 'anthropic', model: requestedModel,
+      messages: [createMessage({
+        role: 'assistant', content: [{ type: 'reasoning', text: 'saved reasoning' }],
+        source: { kind: 'model', provider: 'anthropic', model: requestedModel, replayState },
+      })],
+    }, undefined, onDegrade)
+    const model = getBuiltinModels('anthropic').find(candidate => candidate.id === requestedModel)
+    if (model === undefined) throw new Error('missing Anthropic catalog model')
+    expect(onDegrade).not.toHaveBeenCalled()
+    expect(context.messages[0]).toMatchObject({ model: requestedModel, responseModel })
+    expect(transformMessages(context.messages, model)[0]).toMatchObject({
+      content: [{ type: 'thinking', thinking: 'saved reasoning', thinkingSignature: 'saved-signature' }],
     })
   })
 
@@ -427,7 +485,7 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'private reasoning' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
         source: {
           kind: 'model',
@@ -446,6 +504,8 @@ describe('toPiContext', () => {
     })
     expect(context.messages[0]).not.toHaveProperty('responseModel')
     expect(context.messages[0]).not.toHaveProperty('responseId')
+    expect(state.response).not.toHaveProperty('providerThinkingLevel')
+    expect(context.messages[0]).not.toHaveProperty('providerThinkingLevel')
   })
 
   it('degrades unsupported replay-state versions to provider-neutral history', () => {
@@ -608,12 +668,16 @@ describe('toPiContext', () => {
     ['unknown stop reason', { ...validReplay, response: { ...validResponse, stopReason: 'pause' } }, 'unknown stopReason'],
     ['non-string response model', { ...validReplay, response: { ...validResponse, responseModel: 1 } }, 'responseModel must be a string'],
     ['non-string response id', { ...validReplay, response: { ...validResponse, responseId: 1 } }, 'responseId must be a string'],
+    ['non-string provider thinking level', { ...validReplay, response: { ...validResponse, providerThinkingLevel: 1 } }, 'providerThinkingLevel must be a string'],
+    ['null provider thinking level', { ...validReplay, response: { ...validResponse, providerThinkingLevel: null } }, 'providerThinkingLevel must be a string'],
+    ['non-string prefix digest', { ...validReplay, response: { ...validResponse, prefixDigest: 1 } }, 'prefixDigest must be a string'],
     ['missing blocks', { response: validResponse }, 'blocks must be an array'],
     ['non-array blocks', { ...validReplay, blocks: 'text' }, 'blocks must be an array'],
     ['number block', { ...validReplay, blocks: [1] }, 'block 0 must be an object'],
     ['null block', { ...validReplay, blocks: [null] }, 'block 0 must be an object'],
     ['array block', { ...validReplay, blocks: [[]] }, 'block 0 must be an object'],
     ['unknown block type', { ...validReplay, blocks: [{ type: 'audio' }] }, 'block 0 has an unknown type'],
+    ['non-string namespace', { ...validReplay, blocks: [{ type: 'tool-call', namespace: 1 }] }, 'namespace must be a string'],
     ['non-string signature', { ...validReplay, blocks: [{ type: 'text', textSignature: 1 }] }, 'textSignature must be a string'],
     ['non-boolean redaction', { ...validReplay, blocks: [{ type: 'reasoning', redacted: 'yes' }] }, 'redacted must be boolean'],
   ])('degrades malformed replay state: %s', (_name, replayState, message) => {
@@ -622,6 +686,49 @@ describe('toPiContext', () => {
 })
 
 describe('toStreamChunks', () => {
+  it.each([
+    ['claude-haiku-4-5', 'claude-haiku-4-5-20251001'],
+    ['claude-opus-5', 'kimi-for-coding'],
+    ['claude-opus-5', undefined],
+  ])('retains signed thinking for Anthropic request %s reported as %s', async (requestedModel, reportedModel) => {
+    const native = assistant({
+      api: 'anthropic-messages', provider: 'anthropic', model: requestedModel,
+      ...reportedModel === undefined ? {} : { responseModel: reportedModel },
+      providerThinkingLevel: 'high',
+      content: [{ type: 'thinking', thinking: 'reason', thinkingSignature: 'signed' }],
+    })
+    const chunks = await collect(toStreamChunks(feed(
+      { type: 'done', reason: 'stop', message: native },
+    ), undefined, undefined, requestedModel))
+    const finish = chunks.find(chunk => chunk.type === 'finish')
+    const replayState: unknown = JSON.parse(JSON.stringify(finish?.replayState))
+    expect(replayState).toMatchObject({ response: { model: requestedModel } })
+    if (reportedModel === undefined) {
+      expect(finish?.replayState?.response).not.toHaveProperty('responseModel')
+    } else {
+      expect(replayState).toMatchObject({ response: { responseModel: reportedModel } })
+    }
+    const onDegrade = vi.fn()
+    const context = toPiContext({
+      provider: 'anthropic', model: requestedModel,
+      messages: [createMessage({
+        role: 'assistant', content: [{ type: 'reasoning', text: 'reason' }],
+        source: { kind: 'model', provider: 'anthropic', model: requestedModel, replayState },
+      })],
+    }, undefined, onDegrade)
+    expect(onDegrade).not.toHaveBeenCalled()
+    expect(context.messages[0]).toMatchObject({
+      api: 'anthropic-messages', model: requestedModel, providerThinkingLevel: 'high',
+      content: native.content,
+    })
+    const requested = getBuiltinModels('anthropic').find(model => model.id === requestedModel)
+    if (requested === undefined) throw new Error('missing Anthropic catalog model')
+    expect(transformMessages(context.messages, requested)[0]).toMatchObject({ content: native.content })
+    expect(transformMessages(context.messages, { ...requested, id: 'other-model' })[0]).toMatchObject({
+      content: [],
+    })
+  })
+
   const partialWithToolCall = assistant({
     content: [{ type: 'toolCall', id: 'call-1', name: 'f', arguments: {} }],
   })
@@ -639,7 +746,7 @@ describe('toStreamChunks', () => {
       { type: 'block-start', index: 0, blockType: 'text' },
       { type: 'text-delta', index: 0, text: 'hi' },
       { type: 'block-end', index: 0, block: { type: 'text', text: 'hi' } },
-      { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
+      { type: 'usage', usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 } },
       {
         type: 'finish',
         reason: { kind: 'stop' },
@@ -690,7 +797,7 @@ describe('toStreamChunks', () => {
       { type: 'tool-call-delta', index: 0, id: 'call-1', name: 'f', argumentsDelta: '{"a"' },
       { type: 'tool-call-delta', index: 0, id: 'call-1', name: 'f', argumentsDelta: ':1}' },
       { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1', name: 'f', arguments: '{"a":1}' } },
-      { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } },
+      { type: 'usage', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
       {
         type: 'finish',
         reason: { kind: 'tool-calls' },
@@ -724,7 +831,7 @@ describe('toStreamChunks', () => {
       { type: 'error', reason: 'error', error },
     )))
     expect(chunks).toEqual([
-      { type: 'usage', usage: { inputTokens: 1, outputTokens: 0 } },
+      { type: 'usage', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } },
       { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'PI_AI_ERROR' } } },
     ])
   })
@@ -758,6 +865,14 @@ describe('mapStopReason / mapUsage', () => {
     ['stop', { kind: 'stop' }],
     ['length', { kind: 'max-tokens' }],
     ['toolUse', { kind: 'tool-calls' }],
+    ['pending', {
+      kind: 'error',
+      failure: { message: 'pi-ai stream for model "deepseek-v4-flash" ended pending', code: 'PI_AI_ERROR' },
+    }],
+    ['deferred', {
+      kind: 'error',
+      failure: { message: 'pi-ai deferred response for model "deepseek-v4-flash" is not supported', code: 'PI_AI_ERROR' },
+    }],
     ['aborted', { kind: 'aborted', failure: { message: 'pi-ai stream aborted', code: 'ABORTED' } }],
   ] as const)('maps %s', (stopReason, expected) => {
     expect(mapStopReason(assistant({ stopReason, content: [{ type: 'text', text: 'ok' }] }))).toEqual(expected)
@@ -825,6 +940,19 @@ describe('mapStopReason / mapUsage', () => {
   })
 
   it.each([
+    // The gateway body as the Anthropic SDK renders it: the gateway's own 500 leads.
+    ['a gateway 500 relaying an upstream 401', '500 {"error":{"origin":"upstream","message":"upstream returned an error response: User not found.","type":"upstream_error","code":"upstream_response_error","upstream":{"provider":"custom","status":401,"body":{"error":{"type":"<nil>","message":"User not found."},"type":"error"}}}}', 'SERVER'],
+    ['a 502 quoting a non-retryable 400', '502 {"error":{"message":"upstream status 400"}}', 'SERVER'],
+    ['a 400 quoting a retryable 429', '400 {"error":{"message":"upstream returned 429 Too Many Requests"}}', 'INVALID_REQUEST'],
+    ['a 404 quoting a 403', '404 {"error":{"message":"upstream status 403"}}', 'PI_AI_ERROR'],
+    ['a leading 401', '401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}', 'AUTH'],
+    ['a leading 429', '429 Too Many Requests: slow down', 'RATE_LIMIT'],
+  ] as const)('classifies %s by its leading response status', (_label, errorMessage, code) => {
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
+      .toEqual({ kind: 'error', failure: { message: errorMessage, code } })
+  })
+
+  it.each([
     'other side closed',
     'HTTP2 request did not get a response',
     'WebSocket closed unexpectedly',
@@ -878,10 +1006,11 @@ describe('mapStopReason / mapUsage', () => {
     expect(mapUsage(usage(10, 5, 8, 2))).toEqual({
       inputTokens: 10,
       outputTokens: 5,
+      totalTokens: 25,
       cacheReadTokens: 8,
       cacheWriteTokens: 2,
     })
-    expect(mapUsage(usage(10, 5))).toEqual({ inputTokens: 10, outputTokens: 5 })
+    expect(mapUsage(usage(10, 5))).toEqual({ inputTokens: 10, outputTokens: 5, totalTokens: 15 })
   })
 })
 

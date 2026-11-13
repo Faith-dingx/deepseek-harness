@@ -4,28 +4,24 @@
  * text-storage mechanics — resolve, stat, read/stream, list, the atomic
  * write and the read-match-write edit critical section — are the local
  * implementation's, verbatim; this package adds only the per-call POLICY fence
- * on the two mutations. Reads pass through untouched: every mode permits
+ * on all five mutations. Reads pass through untouched: every mode permits
  * reading.
  *
  * The fence is a policy check in TRUSTED code over a MODEL-CONTROLLED path,
  * NOT a kernel boundary — the operations are the seam's own (open, rename),
  * and only the target path is untrusted, so canonicalize-then-contain is the
- * complete answer to this surface. Kernel-grade isolation of untrusted CODE
- * stays `ctx.shell`'s job (`@deepseek-ai/dsh-bash-sandbox`). This mirrors the
- * `code-runtime` stance: containment, not a security boundary. The residual
+ * complete answer to this surface. This is containment, not a security
+ * boundary; kernel-grade isolation of untrusted CODE stays `ctx.shell`'s job
+ * (`@deepseek-ai/dsh-bash-sandbox`). The residual
  * TOCTOU (an ancestor symlink swapped between the containment re-check and the
  * syscall) is narrowed by re-canonicalizing immediately before delegating and
  * is accepted for this threat model.
  *
  * Per-call policy: `read-only` denies every mutation; `workspace-write` allows
  * a mutation only when the target canonicalizes under the policy's workspace
- * root or a platform temp area (the SAME writable-root set Seatbelt grants,
- * derived from the one `writableRoots` function so bash and fs cannot drift);
- * `danger-full-access` delegates unfenced. A denial throws the structured
- * `FS_SANDBOX_DENIED` — no text inference is needed (unlike bash's kernel
- * stderr), because an in-process fence knows exactly what it refused. The
- * escalation retry lives in the tool layer (`@deepseek-ai/dsh-tool-fs`),
- * exactly as bash's does.
+ * root, an explicit additional writable root, or a platform temp area from the
+ * shared `writableRoots` policy; `danger-full-access` delegates unfenced. A
+ * denial throws the structured `FS_SANDBOX_DENIED`.
  *
  * @module @deepseek-ai/dsh-fs-sandbox
  */
@@ -34,7 +30,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import type { Config as LocalConfig } from '@deepseek-ai/dsh-fs-local'
 import { FsError } from '@deepseek-ai/dsh-fs'
-import type { FsEditOutcome, FsEditRequest, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+import type { FsDeleteOutcome, FsMoveOutcome, FsEditOutcome, FsEditRequest, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import { writableRoots } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
@@ -110,6 +106,40 @@ export class SandboxedFileSystem extends LocalFileSystem {
     sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsEditOutcome> {
     return super.editText(await this.checkedTarget(target, sandboxPolicy), edit, expected, signal)
+  }
+
+  /**
+   * Fence the mutation before delegating to the local provider.
+   * @param sandboxPolicy - per-call mode and workspace root; omit for the deployment fallback.
+   */
+  override async patchText(
+    target: FsTarget, hunks: Parameters<LocalFileSystem['patchText']>[1], expected?: { version: FsVersion },
+    signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy,
+  ): Promise<FsEditOutcome> {
+    return super.patchText(await this.checkedTarget(target, sandboxPolicy), hunks, expected, signal)
+  }
+
+  /**
+   * Fence the mutation before delegating to the local provider.
+   * @param sandboxPolicy - per-call mode and workspace root; omit for the deployment fallback.
+   */
+  override async deleteFile(
+    target: FsTarget, expected?: { version: FsVersion }, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy,
+  ): Promise<FsDeleteOutcome> {
+    return super.deleteFile(await this.checkedTarget(target, sandboxPolicy), expected, signal)
+  }
+
+  /**
+   * Fence the mutation before delegating to the local provider.
+   * @param sandboxPolicy - per-call mode and workspace root; omit for the deployment fallback.
+   */
+  override async moveFile(
+    source: FsTarget, destination: FsTarget, options: Parameters<LocalFileSystem['moveFile']>[2],
+    signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy,
+  ): Promise<FsMoveOutcome> {
+    const checkedSource = await this.checkedTarget(source, sandboxPolicy)
+    const checkedDestination = await this.checkedTarget(destination, sandboxPolicy)
+    return super.moveFile(checkedSource, checkedDestination, options, signal)
   }
 
   /**

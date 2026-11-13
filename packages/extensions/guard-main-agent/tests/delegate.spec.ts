@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import {
   buildDelegatePrompt,
   buildDenialNotice,
@@ -27,7 +27,7 @@ const verifier = (overrides: Partial<PolicyVerdict> = {}): PolicyVerdict => ({
 })
 
 const deps = (tools: DelegateDeps['tools']): DelegateDeps => ({
-  agent: { id: CallId('agent-1') } as never,
+  agent: { id: ToolCallId('agent-1') } as never,
   tools,
   signal,
 })

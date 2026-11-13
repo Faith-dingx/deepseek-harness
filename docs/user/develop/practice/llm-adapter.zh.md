@@ -54,7 +54,8 @@ export function apply(ctx: Context, config: Config) {
 `stream()` 必须按以下协议生成分片：
 
 ```ts
-import { CallId, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { StreamChunk, ToolCallId } from '@deepseek-ai/dsh-llm'
 
 async function* exampleChunks(): AsyncIterable<StreamChunk> {
   // 1. Start each content block with block-start.
@@ -76,7 +77,7 @@ async function* exampleChunks(): AsyncIterable<StreamChunk> {
   yield {
     type: 'tool-call-delta',
     index: 1,
-    id: CallId('call-123'),
+    id: brandString<ToolCallId>('call-123'),
     name: 'bash',
     argumentsDelta: '{"command":"ls"}',
   }
@@ -85,7 +86,7 @@ async function* exampleChunks(): AsyncIterable<StreamChunk> {
     index: 1,
     block: {
       type: 'tool-call',
-      id: CallId('call-123'),
+      id: brandString<ToolCallId>('call-123'),
       name: 'bash',
       arguments: '{"command":"ls"}',
     },
@@ -145,14 +146,14 @@ ctx.llm.registerAdapter(['my-provider'], adapter)
 
 仓库中包含以下两个完整实现：
 
-- `packages/llm/llm-deepseek/` — DeepSeek API 适配器（OpenAI 兼容格式）
+- `packages/llm/llm-deepseek/` — 使用 Messages API 的 DeepSeek 适配器
 - `packages/llm/llm-pi-ai/` — Pi AI 适配器（不同的 API 格式）
 
 对比这两个已交付的适配器，可以看到同一套 harness 契约如何在不同提供方 SDK 之上实现。
 
 ## 错误处理
 
-适配器应通过带稳定 code 的 `LlmError` 抛出传输和协议故障；agent loop（智能体循环）会保留该错误及其 code，用于诊断和策略处理。不要依赖普通 `Error` 被自动转换。每个提供方 HTTP 请求还必须合并 `attributionHeaders()`，并传递 `options.signal`。
+适配器应通过带稳定 code 的 `LlmError` 抛出传输和协议故障。`new LlmError` 只接受 `LLM_FAILURE_CODES` 中的内置 code；适配器自己的 code 通过 `LlmError.fromFailure` 抛出。agent loop（智能体循环）会保留该错误及其 code，用于诊断和策略处理。不要依赖普通 `Error` 被自动转换。每个提供方 HTTP 请求还必须合并 `attributionHeaders()`，并传递 `options.signal`。
 
 ```ts
 import {
@@ -179,7 +180,7 @@ class HttpAdapter extends LlmAdapter {
       ...options.signal ? { signal: options.signal } : {},
     })
     if (!response.ok) {
-      throw new LlmError(`Provider API error: ${response.status}`, 'PROVIDER_HTTP_ERROR')
+      throw LlmError.fromFailure({ message: `Provider API error: ${response.status}`, code: 'PROVIDER_HTTP_ERROR', status: response.status })
     }
     // A real adapter parses the response and emits the complete chunk sequence.
     yield { type: 'finish', reason: { kind: 'stop' } }

@@ -18,10 +18,13 @@
       "path": "../../llm/llm"
     },
     {
-      "path": "../../llm/llm-deepseek"
+      "path": "../../llm/llm-deepseek-api-key"
     },
     {
       "path": "../../core/agent"
+    },
+    {
+      "path": "../../attachment/attachment"
     },
     {
       "path": "../../core/session"
@@ -33,7 +36,22 @@
       "path": "../../subagent/subagent"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../session/working-directory"
+    },
+    {
+      "path": "../../schedule/schedule"
+    },
+    {
+      "path": "../../interaction/user-questions"
+    },
+    {
+      "path": "../../interaction/user-approval"
+    },
+    {
+      "path": "../../interaction/commands"
+    },
+    {
+      "path": "../../goal/goal"
     }
   ]
 }

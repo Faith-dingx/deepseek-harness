@@ -1,6 +1,8 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { Context } from '@deepseek-ai/cordis'
 import Timer from '@deepseek-ai/cordis-plugin-timer'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRegistry from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
@@ -48,7 +50,7 @@ interface Harness {
 
 /**
  * Build a real tree with the runner mounted and a recording gateway provided.
- * @param config - runner config overrides (the vm bound).
+ * @param config - runner configuration overrides.
  * @returns the context, the runner service, and the gateway recorder.
  */
 export async function setup(config?: Config): Promise<Harness> {
@@ -56,6 +58,7 @@ export async function setup(config?: Config): Promise<Harness> {
   await ctx.plugin(Timer)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRegistry)
+  await ctx.plugin(NativeToolExecutor)
   const gateway: Gateway = { events: [] }
   ctx.on('cordis/request-run', (request) => {
     gateway.events.push(['cordis/request-run', request])
@@ -145,9 +148,9 @@ let callCounter = 0
 
 /** Execute a registered tool through the real registry pipeline. */
 export function call(ctx: Context, name: string, args: unknown): Promise<ToolExecutionResult> {
-  return ctx.tools.execute({
+  return executeToolFixture(ctx, {
     signal: new AbortController().signal,
-    callId: CallId(`call-${++callCounter}`),
+    callId: ToolCallId(`call-${++callCounter}`),
     name,
     arguments: args,
   })

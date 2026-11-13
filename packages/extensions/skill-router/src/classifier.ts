@@ -40,8 +40,6 @@ export async function callClassifier(
           { role: 'system', content: system },
           { role: 'user', content: userMessage },
         ],
-        temperature: 0,
-        max_tokens: 200,
       }),
       signal: controller.signal,
     })

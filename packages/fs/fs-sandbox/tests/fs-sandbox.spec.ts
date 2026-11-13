@@ -10,15 +10,18 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { existsSync, realpathSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, parse } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { FsError, FsTargetKey } from '@deepseek-ai/dsh-fs'
 import type { FsTarget } from '@deepseek-ai/dsh-fs'
-import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
+import SandboxPolicyService, { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
+import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import { SandboxedFileSystem } from '@deepseek-ai/dsh-fs-sandbox'
+import { assertWorkspaceOutsideTemp, outsideTempWorkspaceParent } from '../../../../scripts/snapshot-workspace-parent.ts'
 
 let base: string
 let workspace: string
@@ -29,18 +32,18 @@ let fiber: Awaited<ReturnType<Context['plugin']>>
 
 async function boot(mode: SandboxMode): Promise<void> {
   ctx = new Context()
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SandboxPolicyService, { mode, workspaceRoot: workspace })
   fiber = await ctx.plugin(SandboxedFileSystem, { cwd: workspace })
   fs = ctx.fs as SandboxedFileSystem
 }
 
-beforeEach(async () => {
-  // Base under HOME, deliberately NOT tmpdir: `workspace-write` grants /tmp and
-  // os.tmpdir() (parity with the bash runner), so an "outside" dir under tmpdir
-  // would be legitimately writable. Sibling dirs under HOME are outside every
-  // grant, so containment failures are real denials. (The bwrap e2e roots its
-  // workspaces under HOME for the same reason.)
-  base = await mkdtemp(join(homedir(), '.dsh-fssbx-'))
+beforeEach(async ({ onTestFinished }) => {
+  // Both siblings must be outside automatic temp grants for containment denials to be meaningful.
+  const directory = await mkdtemp(join(outsideTempWorkspaceParent(), '.dsh-fssbx-'))
+  onTestFinished(async () => { await rm(directory, { recursive: true, force: true }) })
+  base = realpathSync.native(directory)
+  assertWorkspaceOutsideTemp(base)
   workspace = join(base, 'ws')
   outside = join(base, 'out')
   await mkdir(workspace)
@@ -48,7 +51,6 @@ beforeEach(async () => {
 })
 afterEach(async () => {
   await fiber?.dispose()
-  await rm(base, { recursive: true, force: true })
 })
 
 /** Resolve a path through the backend and return its target. */
@@ -90,6 +92,65 @@ describe('read-only', () => {
 describe('workspace-write containment', () => {
   beforeEach(() => boot('workspace-write'))
 
+  it('applies session grants to writes and edits until their plugin unloads', async ({ onTestFinished }) => {
+    onTestFinished(() => ctx.fiber.dispose())
+    const first = Session.create(SessionId('memory-first'))
+    const second = Session.create(SessionId('memory-second'))
+    const path = join(outside, 'memory.txt')
+    const write = async (session: Session, content: string) => fs.writeText(
+      await target(path), content, undefined, undefined, ctx.sandboxPolicy.resolve({ session }),
+    )
+    const edit = async (session: Session) => fs.editText(
+      await target(path), { oldString: 'memory', newString: 'edited', replaceAll: false },
+      undefined, undefined, ctx.sandboxPolicy.resolve({ session }),
+    )
+    await expect(write(first, 'denied')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    const plugin = await ctx.plugin({
+      inject: ['sandboxPolicy'],
+      apply(scope: Context) { scope.sandboxPolicy.registerWritableRoot(first, outside) },
+    })
+    await write(first, 'memory')
+    expect(await readFile(path, 'utf8')).toBe('memory')
+    await expect(write(second, 'other session')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    await expect(edit(second)).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    await edit(first)
+    expect(await readFile(path, 'utf8')).toBe('edited')
+    setSandboxMode(first, 'read-only')
+    await expect(write(first, 'read-only')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    await expect(edit(first)).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    setSandboxMode(first, 'workspace-write')
+    await write(first, 'updated')
+    await plugin.dispose()
+    await expect(write(first, 'revoked')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    await expect(edit(first)).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    expect(await readFile(path, 'utf8')).toBe('updated')
+  })
+
+  it('rejects invalid grants before workspace writes', async () => {
+    const file = join(outside, 'file.txt')
+    await writeFile(file, 'file')
+    const path = join(workspace, 'blocked.txt')
+    for (const invalid of [join(base, 'missing'), file, join(file, 'child')]) {
+      const policy = { mode: 'workspace-write' as const, workspaceRoot: workspace,
+        additionalWritableRoots: [outside, invalid] }
+      await expect(fs.writeText(await target(path), 'blocked', undefined, undefined, policy))
+        .rejects.toMatchObject({ code: 'SANDBOX_INVALID_ROOT' })
+      expect(existsSync(path)).toBe(false)
+    }
+  })
+
+  it('rejects an extra directory replaced by a symlink to an ungranted sibling', async () => {
+    const extra = join(workspace, 'extra')
+    await mkdir(extra)
+    const policy = { mode: 'workspace-write' as const, workspaceRoot: workspace, additionalWritableRoots: [extra] }
+    await fs.writeText(await target(join(extra, 'before.txt')), 'allowed', undefined, undefined, policy)
+    await rm(extra, { recursive: true })
+    await symlink(outside, extra, 'dir')
+    await expect(fs.writeText(await target(join(outside, 'escape.txt')), 'denied', undefined, undefined, policy))
+      .rejects.toMatchObject({ code: 'SANDBOX_INVALID_ROOT' })
+    expect(existsSync(join(outside, 'escape.txt'))).toBe(false)
+  })
+
   it('a write under the workspace lands', async () => {
     const path = join(workspace, 'nested', 'ok.txt')
     const outcome = await fs.writeText(await target(path), 'inside')
@@ -98,9 +159,14 @@ describe('workspace-write containment', () => {
   })
 
   it('a write to the platform temp area lands (parity with the bash runner grant)', async () => {
-    const path = join(await mkdtemp(join(tmpdir(), 'dsh-fssbx-tmp-')), 'temp.txt')
-    await fs.writeText(await target(path), 'temp')
-    expect(await readFile(path, 'utf8')).toBe('temp')
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-fssbx-tmp-'))
+    try {
+      const path = join(dir, 'temp.txt')
+      await fs.writeText(await target(path), 'temp')
+      expect(await readFile(path, 'utf8')).toBe('temp')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('an absolute path outside the workspace is denied, no file created', async () => {
@@ -171,11 +237,12 @@ describe('workspace-write with the filesystem root as the workspace (a root endi
     // A degenerate but valid config: the filesystem root containing the target.
     // It exercises the separator-suffixed-root branch on POSIX and Windows.
     const rootCtx = new Context()
+    await rootCtx.plugin(SessionProjectionRegistry)
     await rootCtx.plugin(SandboxPolicyService, { mode: 'workspace-write', workspaceRoot: parse(base).root })
     const rootFiber = await rootCtx.plugin(SandboxedFileSystem, { cwd: workspace })
     const rootFs = rootCtx.fs as SandboxedFileSystem
     try {
-      const path = join(base, 'anywhere.txt') // under HOME, outside temp — allowed only via the filesystem root
+      const path = join(base, 'anywhere.txt') // outside temp — allowed only via the filesystem root
       await rootFs.writeText(await rootFs.resolve(path), 'anywhere')
       expect(await readFile(path, 'utf8')).toBe('anywhere')
     } finally {
@@ -232,5 +299,40 @@ describe('FsError identity', () => {
     const error = await fs.writeText(await target(join(workspace, 'x.txt')), 'x').catch((e: unknown) => e)
     expect(error).toBeInstanceOf(FsError)
     expect((error as FsError).code).toBe('FS_SANDBOX_DENIED')
+  })
+})
+
+describe('patch, delete, and move fences', () => {
+  it.each(['read-only', 'workspace-write', 'danger-full-access'] as const)('fences every new mutation under %s', async (mode) => {
+    await boot(mode)
+    const sourcePath = join(workspace, 'source')
+    const outsidePath = join(outside, 'file')
+    await writeFile(sourcePath, 'source\n')
+    await writeFile(outsidePath, 'outside\n')
+    const source = await target(sourcePath)
+    const out = await target(outsidePath)
+    const patch = [{ lineNumber: 3, oldLines: ['source'], newLines: ['patched'], isEndOfFile: false }]
+    if (mode === 'read-only') {
+      await expect(fs.patchText(source, patch)).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+      await expect(fs.deleteFile(source)).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+      await expect(fs.moveFile(source, out, {})).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+      expect(await readFile(sourcePath, 'utf8')).toBe('source\n')
+    } else if (mode === 'workspace-write') {
+      await expect(fs.moveFile(source, out, {})).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+      await expect(fs.moveFile(out, source, {})).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+      await expect(fs.patchText(out, [])).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+      await expect(fs.deleteFile(out)).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+      expect(await readFile(sourcePath, 'utf8')).toBe('source\n')
+      expect(await readFile(outsidePath, 'utf8')).toBe('outside\n')
+      expect(await fs.patchText(source, patch)).toMatchObject({ after: 'patched\n' })
+      const destination = await target(join(workspace, 'moved'))
+      expect(await fs.moveFile(source, destination, {})).toMatchObject({ sourceDeleted: true })
+      expect(await fs.deleteFile(destination)).toEqual({ before: 'patched\n' })
+    } else {
+      expect(await fs.patchText(source, patch)).toMatchObject({ after: 'patched\n' })
+      expect(await fs.moveFile(source, out, {})).toMatchObject({ sourceDeleted: true })
+      expect(await readFile(outsidePath, 'utf8')).toBe('patched\n')
+      expect(await fs.deleteFile(out)).toEqual({ before: 'patched\n' })
+    }
   })
 })

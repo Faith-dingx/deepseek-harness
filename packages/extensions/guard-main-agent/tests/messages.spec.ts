@@ -13,7 +13,7 @@ function assistantEvent(seq: number, text: string): FakeEvent {
 }
 
 function agentWithEvents(events: FakeEvent[]): { session: Session; events: FakeEvent[] } {
-  const session = { events } as unknown as Session
+  const session = { snapshotEvents: () => events } as unknown as Session
   return { session, events }
 }
 
@@ -30,7 +30,7 @@ describe('sessionTexts', () => {
   it('extracts the last 5 rounds as user/assistant pairs', () => {
     const events = Array.from({ length: 12 }, (_, i) =>
       i % 2 === 0 ? userEvent(i, `msg-${i}`) : assistantEvent(i, `msg-${i}`))
-    const texts = sessionTexts({ session: { events } } as never)
+    const texts = sessionTexts({ session: { snapshotEvents: () => events } } as never)
     expect(texts.lastUserText).toBe('msg-10')
     // 12 turns -> 5-round window = 10 entries; the oldest pair (msg-0/msg-1) drops.
     const lines = texts.conversationText.split('\n')
@@ -43,13 +43,13 @@ describe('sessionTexts', () => {
   })
 
   it('returns empty strings for an empty session', () => {
-    const texts = sessionTexts({ session: { events: [] } } as never)
+    const texts = sessionTexts({ session: { snapshotEvents: () => [] } } as never)
     expect(texts.lastUserText).toBe('')
     expect(texts.conversationText).toBe('')
   })
 
   it('handles a session with only assistant messages', () => {
-    const texts = sessionTexts({ session: { events: [assistantEvent(0, 'hi')] } } as never)
+    const texts = sessionTexts({ session: { snapshotEvents: () => [assistantEvent(0, 'hi')] } } as never)
     expect(texts.lastUserText).toBe('')
     expect(texts.conversationText).toContain('assistant: hi')
   })
@@ -57,7 +57,7 @@ describe('sessionTexts', () => {
   it('bounds the total conversation text length', () => {
     const long = 'x'.repeat(2000)
     const events = [userEvent(0, long), assistantEvent(1, long)]
-    const texts = sessionTexts({ session: { events } } as never)
+    const texts = sessionTexts({ session: { snapshotEvents: () => events } } as never)
     expect(texts.conversationText.length).toBeLessThanOrEqual(4000)
   })
 })

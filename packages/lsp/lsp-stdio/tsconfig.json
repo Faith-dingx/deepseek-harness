@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../util/error"
+    },
+    {
       "path": "../../../vendor/cosmokit"
     },
     {
@@ -34,9 +37,6 @@
     },
     {
       "path": "../../subprocess/subprocess"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

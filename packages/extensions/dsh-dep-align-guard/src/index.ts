@@ -31,7 +31,15 @@ import { join, posix } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import type { PostToolDecision, PreToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** 本插件附加的对齐上下文消息；0.2.2 起生产者自声明 kind，无通用 'plugin'。 */
+    'dsh-dep-align-guard': { readonly kind: 'dsh-dep-align-guard' } & ContextFormed
+  }
+}
 
 export const name = 'dsh-dep-align-guard'
 export const inject = ['agents', 'tools']
@@ -593,7 +601,7 @@ function isAlignmentCommandArg(exec: ToolExecution): boolean {
 function attachContext(decision: PostToolDecision, text: string): PostToolDecision {
   const context = createUserMessage({
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: name },
+    source: { kind: 'dsh-dep-align-guard' },
   })
   if (decision.kind !== 'accept') return decision
   const additionalContexts = decision.additionalContexts === undefined

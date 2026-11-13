@@ -22,7 +22,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { promises as nodeFs } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 // Side-effect type import: pulls in dsh-agent's `AssembleContext.agent`
 // augmentation (runtime-types.ts declare module), the same pattern
 // sandbox-policy uses for context.agent?.session access.
@@ -156,7 +156,7 @@ const defaultCompressFs: CompressFs = {
  * every step: any failure keeps the raw history usable.
  */
 export async function runCompression(
-  session: Pick<Session, 'id' | 'events'>,
+  session: { id: SessionId; snapshotEvents(): readonly SessionEvent[] },
   turn: number,
   paths: MemoryPaths,
   config: ResolvedPluginConfig,
@@ -173,8 +173,8 @@ export async function runCompression(
   const now = (deps.now ?? (() => new Date()))()
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch
 
-  const segments = segmentsFromEvents(session.events, range)
-  const classified = await classifySegments(segments, currentTaskContextOf(session.events), {
+  const segments = segmentsFromEvents(session.snapshotEvents(), range)
+  const classified = await classifySegments(segments, currentTaskContextOf(session.snapshotEvents()), {
     endpoint: config.summaryEndpoint,
     model: config.classifyModel,
     confidenceThreshold: config.classifyConfidenceThreshold,
@@ -217,7 +217,7 @@ export async function runCompression(
     /* v8 ignore stop */
 
   const coverage = `第 ${range.from}-${range.to} 轮（保留最近 ${config.retainRecentTurns} 轮原文）`
-  const summary = await generateSummary(usefulSegments, currentTaskContextOf(session.events), {
+  const summary = await generateSummary(usefulSegments, currentTaskContextOf(session.snapshotEvents()), {
     endpoint: config.summaryEndpoint,
     model: config.summaryModel,
     // 实测根因修复: 不再硬编码 10s (同上, 摘要 payload 同样 100KB+)

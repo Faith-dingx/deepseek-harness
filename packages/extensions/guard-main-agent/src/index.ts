@@ -23,7 +23,17 @@
  */
 
 import { promises as fs } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+
+// 0.2.2: MessageSourceMap 改为合并可扩展，不再有 catch-all 'plugin' kind；
+// 插件需自行声明命名 kind（上游 subagent 用同样写法）。
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'guard-main-agent': { kind: 'guard-main-agent' } & ContextFormed
+  }
+}
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -31,7 +41,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { ClassifyErrorType, ClassifierOutput, GuardPluginConfig, PolicyVerdict, ResolvedGuardConfig } from './types.ts'
 import { classify, summarizeArgs } from './classifier.ts'
-import { DELEGATION_TOOLS, DIAGNOSTIC_TOOLS, WRITE_TOOLS, isRmCommand, resolveVerdict } from './policy.ts'
+import { DELEGATION_TOOLS, DIAGNOSTIC_TOOLS, WRITE_TOOLS, isRmCommand, resolveVerdict, rmTargetsOutside, tokenizeShell } from './policy.ts'
 import { createFilePolicy, parsePolicy, type FileDecision, type FilePolicy } from './filePolicy.ts'
 import { buildDenialNotice, delegate, type DelegateDeps, type DelegateOutcome } from './delegate.ts'
 import { TTLMap, cacheKeyString, hashText } from './cache.ts'
@@ -49,16 +59,29 @@ const DEFAULT_CACHE_MAX = 50
 
 /** Plugin configuration, validated by the schemastery schema. */
 export interface Config {
+  /** Classifier chat-completions endpoint (defaults to the LAN gateway). */
   classifierEndpoint?: string
+  /** Classifier model id used for boundary reviews. */
   classifierModel?: string
+  /** Gated-call fallback when the classifier is unavailable: close blocks, open allows (code-class always fails close). */
   fallback?: 'close' | 'open'
+  /** Diagnostic (non-gating) classifier-call fallback when the classifier is unavailable: close blocks, open allows. */
   diagnosticFallback?: 'close' | 'open'
+  /** Code-class (bash/shell/edit) fallback when the classifier is unavailable: close delegates, open allows (2026-10-30 用户授权). */
+  codeClassFallback?: 'close' | 'open'
+  /** Per-classifier-request timeout in milliseconds. */
   timeoutMs?: number
+  /** Retry attempts after a failed classifier call. */
   retryCount?: number
+  /** Classification cache entry lifetime in milliseconds. */
   cacheTtlMs?: number
+  /** Maximum number of classification cache entries. */
   cacheMax?: number
+  /** Agent-preset id whose role boundary this guard enforces. */
   presetId?: string
+  /** Optional override path for the file-write whitelist policy. */
   filePolicyPath?: string
+  /** Optional override path for the role-boundary document. */
   boundaryDocPath?: string
 }
 
@@ -67,6 +90,7 @@ export const Config: z<Config> = z.object({
   classifierModel: z.string().default(DEFAULT_MODEL),
   fallback: z.union(['close', 'open'] as const).default('close'),
   diagnosticFallback: z.union(['close', 'open'] as const).default('open'),
+  codeClassFallback: z.union(['close', 'open'] as const).default('close'),
   timeoutMs: z.number().default(DEFAULT_TIMEOUT_MS),
   retryCount: z.number().default(DEFAULT_RETRY_COUNT),
   cacheTtlMs: z.number().default(DEFAULT_CACHE_TTL_MS),
@@ -84,6 +108,7 @@ export function resolveConfig(raw: GuardPluginConfig): ResolvedGuardConfig {
     classifierModel: raw.classifierModel ?? DEFAULT_MODEL,
     fallback: raw.fallback ?? 'close',
     diagnosticFallback: raw.diagnosticFallback ?? 'open',
+    codeClassFallback: raw.codeClassFallback ?? 'close',
     timeoutMs: raw.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     retryCount: raw.retryCount ?? DEFAULT_RETRY_COUNT,
     cacheTtlMs: raw.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS,
@@ -148,16 +173,22 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (decision.allowed) return next()
       return blockAndDeny(ctx, exec, verdict)
     }
-    // Shell command hard-block: the main agent is FORBIDDEN from executing
-    // `rm` commands (用户指令 2026-08-25; 软链接 rm -rf 尾斜杠误删 node_modules
-    // 教训 2026-08-25). Machine-gated, not a classifier decision — it bypasses
-    // the classifier and its cache entirely: no context, model availability,
-    // or verdict can rescue an rm call.
+    // Shell rm rule (2026-10-30 用户授权放宽): deletions CONFINED to the
+    // workspace pass; anything touching paths outside it, the home root or `/`
+    // stays hard-blocked and delegated (2026-08-25 软链接 rm -rf 尾斜杠误删
+    // node_modules 教训 — the realpath check below closes that hole again).
+    // Machine-gated, not a classifier decision: no verdict can rescue a
+    // risky rm call.
     const shellCommand = extractShellCommand(exec)
     if (shellCommand !== null && isRmCommand(shellCommand)) {
+      const offenders = await rmOffenders(shellCommand, workspacePath(agent))
+      if (offenders.length === 0) {
+        logDecision(ctx, decisionRecord(toolName, 'allow', 'rm 目标均在工作区内（2026-10-30 授权）', null), started, 'rm-in-workspace-allow')
+        return next()
+      }
       const verdict: PolicyVerdict = {
         verdict: 'block',
-        reason: 'shell 硬禁: 主 agent 禁止执行 rm 命令（用户指令 2026-08-25）',
+        reason: `shell 硬禁: rm 命令目标越出工作区或为危险位置（${offenders.join(', ')}；用户指令 2026-10-30）`,
         delegateTo: 'code-agent',
         reviewPrompt: null,
         classifierFailed: false,
@@ -168,6 +199,35 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
     return classifyAndDecide(ctx, exec, cache, resolved, next, started)
   })
+}
+
+/**
+ * Offending targets of an rm command (empty array = safe to allow).
+ * Layer 1 lexical: outside workspace, home root or `/` (rmTargetsOutside).
+ * Layer 2 physical: realpath each existing target so a symlink pointing
+ * outside the workspace cannot smuggle the deletion out (2026-08-25 事故).
+ */
+async function rmOffenders(command: string, cwd: string): Promise<string[]> {
+  const home = os.homedir()
+  const lexical = rmTargetsOutside(command, cwd, home)
+  if (lexical.length > 0) return lexical
+  const tokens = tokenizeShell(command)
+  const index = tokens.findIndex(t => t === 'rm' || t === '\\rm')
+  if (index === -1) return []
+  for (const raw of tokens.slice(index + 1).filter(t => !t.startsWith('-'))) {
+    const expanded = raw.startsWith('~') ? path.join(home, raw.slice(1)) : raw
+    const absolute = path.resolve(cwd, expanded)
+    try {
+      const real = await fs.realpath(absolute)
+      const relative = path.relative(cwd, real)
+      if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+        return [`${raw} → ${real}`]
+      }
+    } catch {
+      // Non-existent target: the lexical layer already covered its path.
+    }
+  }
+  return []
 }
 
 /** Evaluate a non-write, non-diagnostic tool call through the classifier. */
@@ -247,7 +307,7 @@ async function blockAndDeny(
     const notice = buildDenialNotice(verdict, userMessage)
     agent.inject(createUserMessage({
       content: [{ type: 'text', text: notice.text }],
-      source: { kind: 'plugin', plugin: name, form: 'notice', summary: notice.summary },
+      source: { kind: 'guard-main-agent', form: 'notice', summary: notice.summary },
     }))
   }
 
@@ -266,7 +326,7 @@ async function blockAndDeny(
       ctx.logger.info(`[guard-main-agent] delegated to ${verdict.delegateTo}; result head: ${outcome.summary.slice(0, 200)}`)
       agent.inject(createUserMessage({
         content: [{ type: 'text', text: `[guard-main-agent] ${verdict.delegateTo} 已代为执行，结果摘要：\n${outcome.summary.slice(0, 2000)}` }],
-        source: { kind: 'plugin', plugin: name, form: 'notice', summary: `delegated to ${verdict.delegateTo}` },
+        source: { kind: 'guard-main-agent', form: 'notice', summary: `delegated to ${verdict.delegateTo}` },
       }))
     }
   }
@@ -359,7 +419,7 @@ function workspacePath(agent: Agent | undefined): string {
 /** Fail-close fallback policy: whitelist empty, everything denied. */
 function denyAllFilePolicy(cwd: string): FilePolicy {
   return createFilePolicy(
-    { defaultPolicy: 'deny', symlinkResolve: true, whitelist: [], temporaryOverrides: [] },
+    { defaultPolicy: 'deny', symlinkResolve: true, blacklist: [], whitelist: [], temporaryOverrides: [] },
     { cwd },
   )
 }

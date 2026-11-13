@@ -40,7 +40,7 @@ const extensionsRoot = resolve(
   options['extensions-root'] ?? join(repoRoot, 'packages/extensions'),
 )
 const harnessCatalogPath = resolve(
-  options['harness-catalog'] ?? join(extensionsRoot, 'tool-cordis/src/generated/api-catalog.ts'),
+  options['harness-catalog'] ?? join(extensionsRoot, 'tool-cordis/src/api-catalog.ts'),
 )
 const clientCatalogPath = resolve(
   options['client-catalog'] ?? join(extensionsRoot, 'cordis-client-runner/src/client/api-catalog.ts'),

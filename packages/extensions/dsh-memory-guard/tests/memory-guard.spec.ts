@@ -12,7 +12,8 @@ import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 import * as memoryGuard from '../src/index.ts'
 
@@ -20,6 +21,11 @@ async function setup(config: Record<string, unknown> = {}): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  // cordis 4.1 (0.2.2-rc.2) parks a plugin whose `inject` is unsatisfied in
+  // PENDING instead of activating it: without the projection registry the
+  // AgentRegistry never publishes `agents`, and the guard stays silently
+  // inactive — every payload would be allowed.
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(memoryGuard, config)
   return ctx
@@ -33,8 +39,8 @@ async function preExecute(
 ): Promise<{ kind: string; reason?: string; nextCalls: number }> {
   const exec = {
     token: Symbol('exec'),
-    callId: CallId('memory-guard-call'),
-    rootCallId: CallId('memory-guard-call'),
+    callId: ToolCallId('memory-guard-call'),
+    rootToolCallId: ToolCallId('memory-guard-call'),
     name,
     arguments: args,
     signal: new AbortController().signal,

@@ -15,7 +15,7 @@
  * @module @deepseek-ai/dsh-skill-router
  */
 
-import { createUserMessage, type MessageSource } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type ContextFormed, type MessageSource } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type { SkillCatalogEntry } from './types.ts'
 
@@ -35,10 +35,10 @@ export interface SkillCatalogSource {
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'skill-catalog': SkillCatalogSource
+    /** 本插件自身注入的上下文消息来源（0.2.2 起生产者各自声明 kind，无通用 'plugin'）。 */
+    'skill-router': { readonly kind: 'skill-router' } & ContextFormed
   }
 }
-
-const SKILL_PLUGIN = 'skill-router'
 
 /** Read the usable entries a catalog source carries, or undefined if unreadable. */
 function catalogEntries(source: unknown): SkillCatalogEntry[] | undefined {
@@ -135,4 +135,4 @@ export function interceptCatalog(messages: readonly UserMessage[], included: rea
 }
 
 /** The source tag used when the plugin itself injects context messages. */
-export const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: SKILL_PLUGIN }
+export const PLUGIN_SOURCE: MessageSource = { kind: 'skill-router' }

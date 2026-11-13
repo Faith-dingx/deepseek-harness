@@ -1,33 +1,48 @@
 /**
- * Subagent guard: caps concurrent subagent starts and force-disposes idle or
- * zombie runs so runaway delegation cannot permanently exhaust the harness.
+ * Subagent guard: caps concurrent subagent activations and force-disposes idle
+ * or zombie activations so runaway delegation cannot permanently exhaust the
+ * harness.
  *
- * Design notes (per the reviewed plan):
- * - The `subagent/end` listener matches by `info.id` (SessionId), which equals
- *   `run.id`, NOT `info.runId` (a random UUID) — see `observeRun` in the
- *   subagent package.
- * - Per-run metadata (`lastSeenCount`/`lastEventTime`) lives in each entry of
- *   `activeRuns`; nothing is shared across runs.
+ * Design notes (per the reviewed plan, re-based on the 0.2.2 activation API):
+ * - 0.2.2 replaced `runtime.start(name, request) -> SubagentRun` with
+ *   `runtime.startActivation(spec) -> SubagentActivation`; the wrapper below
+ *   keeps the same admission/limit/disposal policy over the new entry point.
+ * - The `subagent/end` listener matches by `info.id`, which is the activation's
+ *   durable `childId` — NOT `info.runId` (a random UUID per epoch).
+ * - Per-activation metadata (`lastSeenCount`/`lastEventTime`) lives in each
+ *   entry of `activeRuns`; nothing is shared across activations.
  * - A module-level `_guardInstalled` flag prevents double-wrapping under HMR;
- *   the disposer restores `originalStart` and clears the flag.
+ *   the disposer restores `originalStartActivation` and clears the flag.
  * - The watchdog is an async-generator fiber effect; cordis accepts
  *   `AsyncIterable` effects and interrupts the generator on dispose.
+ * - Idle disposal calls `activation.dispose()` (the exact-activation teardown),
+ *   never a later resume of the same child.
  *
  * @module @deepseek-ai/dsh-subagent-guard
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import type { MessageId } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import type {
+  SubagentActivation,
+  SubagentActivationSpec,
+  SubagentRunEndInfo,
+} from '@deepseek-ai/dsh-subagent'
 import { resolveConfig } from './config.ts'
 import type { RawConfig } from './types.ts'
-import type { SubagentRun } from '@deepseek-ai/dsh-subagent/src/types.ts'
-import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 
 export const name = 'subagent-guard'
-export const inject = ['subagents', 'sessions'] as const
+export const inject = ['subagents', 'sessions']
 
 // H5 fix: module-level flag prevents double wrapping across hot reloads.
 let _guardInstalled = false
+
+/**
+ * 0.2.2 的 `startActivation` 是重载方法（带保留 childId 时返回值附带 messageId）。
+ * 这个别名只用于给 bind 后的原方法一个可调用的实现签名，包装层仍按重载声明。
+ */
+type StartActivationCore = (spec: SubagentActivationSpec) => Promise<SubagentActivation>
 
 export function apply(ctx: Context, rawConfig: RawConfig = {}): void | (() => void) {
   // L3(a): `enabled: false` bypasses every interception.
@@ -40,24 +55,25 @@ export function apply(ctx: Context, rawConfig: RawConfig = {}): void | (() => vo
   // H5: bind the original start BEFORE the re-entrancy check so a rejected
   // re-apply can never capture an already-wrapped implementation. Keep the
   // unbound reference too, so the disposer restores the exact original start.
-  // eslint-disable-next-line @typescript-eslint/unbound-method -- 有意：disposer 需用未绑定原引用恢复 start，调用走下方 bind 版
-  const originalUnbound = ctx.subagents.start
-  const originalStart = originalUnbound.bind(ctx.subagents)
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- 有意：disposer 需用未绑定原引用恢复，调用走下方 bind 版
+  const originalUnbound = ctx.subagents.startActivation
+  const originalStart: StartActivationCore = originalUnbound.bind(ctx.subagents)
 
   if (_guardInstalled) return
   _guardInstalled = true
 
   let currentActive = 0
-  // H1: per-run metadata — nothing shared across runs.
+  // H1: per-activation metadata — nothing shared across activations.
   const activeRuns = new Map<SessionId, {
     startedAt: number
-    run: SubagentRun
+    /** Exact-activation teardown retained for the idle watchdog. */
+    dispose: () => Promise<void>
     lastSeenCount: number
     lastEventTime: number
   }>()
 
   // M4: register the end listener exactly once, in apply, not per start.
-  // H0: match by info.id (SessionId = run.id), never by info.runId (UUID).
+  // H0: match by info.id (durable childId), never by info.runId (UUID).
   const offEnd = ctx.on('subagent/end', (info: SubagentRunEndInfo) => {
     if (activeRuns.has(info.id)) {
       activeRuns.delete(info.id)
@@ -65,31 +81,39 @@ export function apply(ctx: Context, rawConfig: RawConfig = {}): void | (() => vo
     }
   })
 
-  ctx.subagents.start = async (name, request) => {
+  // 重载声明保持 0.2.2 服务面的返回值形状：带保留 childId 的调用仍返回 messageId。
+  function guardedStart(
+    spec: SubagentActivationSpec & { readonly childId: SessionId },
+  ): Promise<SubagentActivation & { readonly messageId: MessageId }>
+  function guardedStart(spec: SubagentActivationSpec): Promise<SubagentActivation>
+  async function guardedStart(spec: SubagentActivationSpec): Promise<SubagentActivation> {
     if (currentActive >= config.maxConcurrent) {
       ctx.logger.warn(`[subagent-guard] 拒绝：子代理并发已达上限（${config.maxConcurrent}）`)
       throw new Error(`当前活跃子代理已达上限（${config.maxConcurrent}），子代理并发已满`)
     }
 
     // H3: never leak a slot when the underlying start fails.
-    let run: SubagentRun
+    let activation: SubagentActivation
     try {
       currentActive++
-      run = await originalStart(name, request)
+      activation = await originalStart(spec)
     } catch (e) {
       currentActive--
       throw e
     }
 
-    activeRuns.set(run.id, {
+    // childId 是持久身份，`subagent/end` 的 info.id 与它同源。
+    activeRuns.set(activation.childId, {
       startedAt: Date.now(),
-      run,
+      dispose: () => activation.dispose(),
       lastSeenCount: -1,
       lastEventTime: 0,
     })
 
-    return run
+    return activation
   }
+
+  ctx.subagents.startActivation = guardedStart
 
   // Idle watchdog: an async-generator fiber effect, interruptible on dispose.
   const watchdog = ctx.effect(async function* idleWatchdog() {
@@ -103,8 +127,8 @@ export function apply(ctx: Context, rawConfig: RawConfig = {}): void | (() => vo
           const session = ctx.sessions.get(runId)
           if (!session) {
             if (Date.now() - meta.startedAt > config.idleTimeoutMs) {
-              ctx.logger.warn(`[subagent-guard] 释放远端僵尸 run=${runId}`)
-              await meta.run.dispose()
+              ctx.logger.warn(`[subagent-guard] 释放远端僵尸 activation=${runId}`)
+              await meta.dispose()
               if (activeRuns.has(runId)) {
                 activeRuns.delete(runId)
                 currentActive--
@@ -113,14 +137,14 @@ export function apply(ctx: Context, rawConfig: RawConfig = {}): void | (() => vo
             continue
           }
 
-          const events = session.events
+          const events = session.snapshotEvents()
           const currentCount = events.length
 
           if (currentCount === meta.lastSeenCount) {
             const idleMs = Date.now() - meta.lastEventTime
             if (idleMs > config.idleTimeoutMs) {
-              ctx.logger.warn(`[subagent-guard] 释放僵尸 run=${runId}`)
-              await meta.run.dispose()
+              ctx.logger.warn(`[subagent-guard] 释放僵尸 activation=${runId}`)
+              await meta.dispose()
               if (activeRuns.has(runId)) {
                 activeRuns.delete(runId)
                 currentActive--
@@ -142,7 +166,7 @@ export function apply(ctx: Context, rawConfig: RawConfig = {}): void | (() => vo
   // every guard-owned resource. Note: cordis has no ctx.off — ctx.on returns
   // a disposer, which is what offEnd is.
   return () => {
-    ctx.subagents.start = originalUnbound
+    ctx.subagents.startActivation = originalUnbound
     _guardInstalled = false
     activeRuns.clear()
     currentActive = 0

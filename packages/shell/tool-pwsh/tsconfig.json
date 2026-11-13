@@ -51,7 +51,10 @@
       "path": "../../sandbox/sandbox-policy"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../session/working-directory"
+    },
+    {
+      "path": "../../subprocess/subprocess"
     }
   ]
 }

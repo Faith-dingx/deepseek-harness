@@ -8,6 +8,7 @@ const config: ResolvedGuardConfig = {
   classifierModel: 'agnes/agnes-2.5-flash',
   fallback: 'close',
   diagnosticFallback: 'open',
+  codeClassFallback: 'close',
   timeoutMs: 5000,
   retryCount: 1,
   cacheTtlMs: 600000,
@@ -46,7 +47,7 @@ function abortAwareNever(): (input: string, init: RequestInit) => Promise<Respon
 }
 
 describe('classifier payload', () => {
-  it('posts the endpoint with model, system+user messages, temperature 0 and bounded tokens', async () => {
+  it('posts a minimal payload: model + system/user messages, no sampling params', async () => {
     const fetchMock = vi.fn(replyJson(JSON.stringify({ verdict: 'block', reason: 'r' })))
     vi.stubGlobal('fetch', fetchMock)
     await classify(config, context)
@@ -57,12 +58,15 @@ describe('classifier payload', () => {
     const body = JSON.parse(init.body as string) as {
       model: string
       messages: { role: string; content: string }[]
-      temperature: number
-      max_tokens: number
+      temperature?: number
+      max_tokens?: number
     }
     expect(body.model).toBe('agnes/agnes-2.5-flash')
-    expect(body.temperature).toBe(0)
-    expect(body.max_tokens).toBe(200)
+    // Minimal payload by design (user directive 2026-09-10): sampling params
+    // must not be sent — reasoning-grade router targets may reject them, and a
+    // rejected classify call is a fail-close outage for all guarded tool calls.
+    expect(body.temperature).toBeUndefined()
+    expect(body.max_tokens).toBeUndefined()
     expect(body.messages[0]?.role).toBe('system')
     expect(body.messages[0]?.content).toContain('guard classifier')
     expect(body.messages[1]?.role).toBe('user')

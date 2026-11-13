@@ -19,28 +19,10 @@
       "path": "../../../vendor/include"
     },
     {
-      "path": "../../core/agent"
-    },
-    {
-      "path": "../../core/scope"
-    },
-    {
-      "path": "../../core/session"
-    },
-    {
-      "path": "../../core/system-prompt"
-    },
-    {
-      "path": "../../settings/settings"
-    },
-    {
-      "path": "../../util/atomic-write"
-    },
-    {
       "path": "../../util/home-paths"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../agent-preset-registry"
     }
   ]
 }

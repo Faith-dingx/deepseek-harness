@@ -179,7 +179,7 @@ describe('runCompression 端到端 (T16: 先甄别归档→后摘要→再审核
     events[22] = assistantMsg(6, '已记录')
 
     const registered: Array<[string, string]> = []
-    const session = { id: SessionId('it-session'), events }
+    const session = { id: SessionId('it-session'), snapshotEvents: () => events }
     const outcome = await runCompression(session, 10, paths, config, {
       fsImpl: realFs,
       fetchImpl,
@@ -216,7 +216,7 @@ describe('runCompression 端到端 (T16: 先甄别归档→后摘要→再审核
     const fetchImpl: typeof fetch = async () => {
       return new Response(JSON.stringify({ choices: [{ message: { content: '# 对话历史摘要\n## Primary Request\n- x\n## Key Concepts\n- k\n## Files\n- f\n## Errors\n- e\n## Pending Jobs\n- j\n' } }] }), { status: 200 })
     }
-    const outcome = await runCompression({ id: SessionId('s'), events: tenTurnEvents() }, 10, paths, config, {
+    const outcome = await runCompression({ id: SessionId('s'), snapshotEvents: () => tenTurnEvents() }, 10, paths, config, {
       fetchImpl,
       userMemoryTarget: `${home}/.dsh/memory/MEMORY.md`,
       // registerPendingWrite 是 CompressionDeps 必填字段（src 无 fallback）; noop 保持"未注入注册"语义
@@ -231,7 +231,7 @@ describe('runCompression 端到端 (T16: 先甄别归档→后摘要→再审核
   it('degrades to useful when the LLM fails (fail-open, 保留原文)', async () => {
     await clearWs()
     const fetchImpl: typeof fetch = async () => { throw new Error('llm down') }
-    const outcome = await runCompression({ id: SessionId('it-session'), events: tenTurnEvents() }, 10, paths, config, {
+    const outcome = await runCompression({ id: SessionId('it-session'), snapshotEvents: () => tenTurnEvents() }, 10, paths, config, {
       fsImpl: realFs,
       fetchImpl,
       userMemoryTarget: `${home}/.dsh/memory/MEMORY.md`,
@@ -246,7 +246,7 @@ describe('runCompression 端到端 (T16: 先甄别归档→后摘要→再审核
 
   it('compression below threshold does nothing (T15 触发阈值)', async () => {
     await clearWs()
-    const outcome = await runCompression({ id: SessionId('s'), events: tenTurnEvents() }, 5, paths, config, {
+    const outcome = await runCompression({ id: SessionId('s'), snapshotEvents: () => tenTurnEvents() }, 5, paths, config, {
       fsImpl: realFs,
       userMemoryTarget: `${home}/.dsh/memory/MEMORY.md`,
       registerPendingWrite: () => {},
@@ -270,7 +270,7 @@ describe('runCompression 端到端 (T16: 先甄别归档→后摘要→再审核
       bodies.push(typeof init?.body === 'string' ? init.body : '')
       return new Response(JSON.stringify({ choices: [{ message: { content: '# 对话历史摘要\n## Primary Request\n- ok\n## Key Concepts\n- k\n## Files\n- f\n## Errors\n- e\n## Pending Jobs\n- j\n' } }] }), { status: 200 })
     }
-    const outcome = await runCompression({ id: SessionId('cap-session'), events }, 64, paths, config, {
+    const outcome = await runCompression({ id: SessionId('cap-session'), snapshotEvents: () => events }, 64, paths, config, {
       fsImpl: realFs,
       fetchImpl,
       userMemoryTarget: `${home}/.dsh/memory/MEMORY.md`,
@@ -304,7 +304,7 @@ describe('runCompression 端到端 (T16: 先甄别归档→后摘要→再审核
     })
     const fast = resolveConfig({ pollIntervalMs: 60000, classifyTimeoutMs: 30, summaryTimeoutMs: 30 })
     const started = Date.now()
-    const outcome = await runCompression({ id: SessionId('timeout-session'), events: tenTurnEvents() }, 10, paths, fast, {
+    const outcome = await runCompression({ id: SessionId('timeout-session'), snapshotEvents: () => tenTurnEvents() }, 10, paths, fast, {
       fsImpl: realFs,
       fetchImpl: neverSettle,
       userMemoryTarget: `${home}/.dsh/memory/MEMORY.md`,
@@ -485,7 +485,7 @@ describe('handleTurnEnd / handlePoll (T16 事件入口, 可测试编排)', () =>
     await fs.mkdir(ws, { recursive: true })
     const events = tenTurnEvents()
     events[3] = userMsg(2, '好的，谢谢！')
-    const session = { id: SessionId('h1'), header: { cwd: ws }, events } as unknown as Session
+    const session = { id: SessionId('h1'), header: { cwd: ws }, snapshotEvents: () => events } as unknown as Session
     const watcher = new MtimeWatcher()
     const registry = new PendingWriteRegistry()
     const trigger = new TurnTrigger({ thresholdTurns: 8 })
@@ -513,7 +513,7 @@ describe('handleTurnEnd / handlePoll (T16 事件入口, 可测试编排)', () =>
     await fs.mkdir(ws, { recursive: true })
     const events = tenTurnEvents()
     events[3] = userMsg(2, '好的，谢谢！')
-    const session = { id: SessionId('h1'), header: {}, events } as unknown as Session // header 无 cwd
+    const session = { id: SessionId('h1'), header: {}, snapshotEvents: () => events } as unknown as Session // header 无 cwd
     const watcher = new MtimeWatcher()
     const registry = new PendingWriteRegistry()
     const trigger = new TurnTrigger({ thresholdTurns: 8 })
@@ -531,7 +531,7 @@ describe('handleTurnEnd / handlePoll (T16 事件入口, 可测试编排)', () =>
     await fs.mkdir(ws, { recursive: true })
     const events = tenTurnEvents()
     events[3] = userMsg(2, '好的，谢谢！')
-    const session = { id: SessionId('h-log'), header: { cwd: ws }, events } as unknown as Session
+    const session = { id: SessionId('h-log'), header: { cwd: ws }, snapshotEvents: () => events } as unknown as Session
     const watcher = new MtimeWatcher()
     const registry = new PendingWriteRegistry()
     const trigger = new TurnTrigger({ thresholdTurns: 8 })
@@ -557,7 +557,7 @@ describe('handleTurnEnd / handlePoll (T16 事件入口, 可测试编排)', () =>
   })
 
   it('uses event data path and never throws on missing workspace (fail-open 入口)', async () => {
-    const session = { id: SessionId('h-nope'), header: { cwd: `${tmpRoot}/nope` }, events: [] } as unknown as Session
+    const session = { id: SessionId('h-nope'), header: { cwd: `${tmpRoot}/nope` }, snapshotEvents: () => [] } as unknown as Session
     const watcher = new MtimeWatcher()
     const registry = new PendingWriteRegistry()
     const trigger = new TurnTrigger({ thresholdTurns: 8 })
@@ -603,7 +603,7 @@ describe('apply() plugin mount (T16 插件入口)', () => {
     expect(apply.name).toBe('apply')
     expect(os.homedir().length).toBeGreaterThan(0)
     // 触发一次 session/event → apply 注册的回调执行 handleTurnEnd（非 turn/end 直接返回）
-    ctx.emit('session/event', { id: SessionId('s1'), header: { cwd: ws }, events: [] } as unknown as Session, event('user/message', { content: 'x' }))
+    ctx.emit('session/event', { id: SessionId('s1'), header: { cwd: ws }, snapshotEvents: () => [] } as unknown as Session, event('user/message', { content: 'x' }))
     // 等待一个 poll tick（10ms 间隔）→ poll 回调执行且不抛错
     await new Promise((r) => { setTimeout(r, 60) })
     // 卸载插件 → 清理 poll 定时器 (ctx.effect yield disposer)

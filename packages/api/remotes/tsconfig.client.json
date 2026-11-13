@@ -11,6 +11,8 @@
     "src/types.ts"
   ],
   "references": [
+    { "path": "../../team/agent-team" },
+    { "path": "../../client/product-analytics/tsconfig.client.json" },
     {
       "path": "../../../vendor/cordis"
     },
@@ -21,8 +23,10 @@
       "path": "../../client/connection/tsconfig.client.json"
     },
     {
+      "path": "../../client/file-upload/tsconfig.client.json"
+    },
+    {
       "path": "../../credentials/credentials"
-
     },
     {
       "path": "../../context/file-reference"
@@ -31,10 +35,16 @@
       "path": "../../context/session-reference"
     },
     {
+      "path": "../../core/session"
+    },
+    {
       "path": "../../extensions/cordis-host-runner"
     },
     {
       "path": "../../goal/goal"
+    },
+    {
+      "path": "../../schedule/schedule"
     },
     {
       "path": "../../feedback/message-feedback"
@@ -46,16 +56,67 @@
       "path": "../../interaction/commands"
     },
     {
+      "path": "../../interaction/permission-presets"
+    },
+    {
       "path": "../../llm/llm"
     },
     {
-      "path": "../../preset/agent-presets"
+      "path": "../../preset/agent-preset-registry"
     },
     {
       "path": "../../settings/settings"
     },
     {
+      "path": "../../subagent/subagent"
+    },
+    {
+      "path": "../../interaction/user-approval"
+    },
+    {
+      "path": "../../interaction/user-questions"
+    },
+    {
+      "path": "../job-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../session-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../workspace-files/tsconfig.client.json"
+    },
+    {
+      "path": "../settings-controller"
+    },
+    {
+      "path": "../workspace-controller/tsconfig.client.json"
+    },
+    {
       "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../feedback/command-feedback"
+    },
+    {
+      "path": "../terminal-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../../boot/plugin-manager"
+    },
+    {
+      "path": "../../mcp/mcp-manager"
+    },
+    {
+      "path": "../../boot/plugin-market"
+    },
+    {
+      "path": "../../document/office-kit"
+    },
+    {
+      "path": "../../credentials/deepseek-account"
+    },
+    {
+      "path": "../../web/web"
     }
   ]
 }

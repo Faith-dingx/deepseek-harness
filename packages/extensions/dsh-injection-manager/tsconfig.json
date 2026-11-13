@@ -18,7 +18,13 @@
       "path": "../../llm/llm"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../core/tools"
+    },
+    {
+      "path": "../../core/agent"
+    },
+    {
+      "path": "../../core/scope"
     }
   ]
 }

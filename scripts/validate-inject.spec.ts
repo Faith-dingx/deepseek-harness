@@ -80,8 +80,8 @@ function fixture(options: FixtureOptions = {}): string {
   const harness = 'harness' in catalogs ? catalogs.harness : HARNESS_CATALOG
   const client = 'client' in catalogs ? catalogs.client : CLIENT_CATALOG
   if (harness !== undefined) {
-    mkdirSync(join(root, 'tool-cordis/src/generated'), { recursive: true })
-    writeFileSync(join(root, 'tool-cordis/src/generated/api-catalog.ts'), harness)
+    mkdirSync(join(root, 'tool-cordis/src'), { recursive: true })
+    writeFileSync(join(root, 'tool-cordis/src/api-catalog.ts'), harness)
   }
   if (client !== undefined) {
     mkdirSync(join(root, 'cordis-client-runner/src/client'), { recursive: true })

@@ -2,9 +2,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
-import AgentRegistry, { agentEvents, type Agent } from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { agentEvents, type Agent, type Model } from '@deepseek-ai/dsh-agent'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import * as skillRouter from '../src/index.ts'
 import type { SkillCatalogSource } from '../src/injector.ts'
+
+/** Structural Model stub: these fixtures never read or change model selection. */
+const unusedModel: Model = {
+  current: () => undefined,
+  select: () => {},
+}
 
 const ALL = [
   { name: 'skill-docs', description: 'planning & docs' },
@@ -27,10 +34,11 @@ function userMessage(text: string): UserMessage {
 
 /** Minimal agent whose session header carries the cwd + id used by the plugin. */
 function agentFor(cwd: string, id = 'skill-router-agent'): Agent {
-  const session = Session.create(SessionId(id), [], { version: 0, id: SessionId(id), createdAt: 0, cwd })
+  const session = Session.create(SessionId(id), [], { version: 4, isSeeded: false, id: SessionId(id), createdAt: 0, cwd })
   return {
     id: SessionId(id),
     options: {},
+    model: unusedModel,
     session,
     inbox: {} as never,
     status: 'running',
@@ -54,7 +62,13 @@ async function dispatchPreStep(
   const signal = new AbortController().signal
   const decision = await agentEvents(ctx, agent).waterfall(
     'agent/pre-step',
-    { messages: claimedMessages, turn: 1, step: 1, signal },
+    {
+      messages: claimedMessages,
+      turn: 1,
+      step: 1,
+      signal,
+      modelSelection: { provider: 'test', model: 'test' },
+    },
     () => Promise.resolve({ kind: 'enter' as const, messages: [catalogMessage(catalogEntries)] }),
   )
   if (decision.kind === 'reject') return []
@@ -70,6 +84,11 @@ function catalogEntriesOf(messages: UserMessage[]): string[] | undefined {
 async function setup(fetchImpl: () => Promise<Response>): Promise<Context> {
   vi.stubGlobal('fetch', fetchImpl)
   const ctx = new Context()
+  // cordis 4.1 (0.2.2-rc.2) parks a plugin whose `inject` is unsatisfied in
+  // PENDING instead of activating it: without the projection registry the
+  // AgentRegistry never publishes `agents`, and the router stays silently
+  // inactive — the fail-close path could not be observed.
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(skillRouter, {
     classifierEndpoint: 'http://classifier:9888/v1/chat/completions',

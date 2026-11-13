@@ -11,6 +11,7 @@
  * @module @deepseek-ai/dsh-guard-main-agent
  */
 
+import path from 'node:path'
 import type { ClassifierOutput, PolicyVerdict, ResolvedGuardConfig } from './types.ts'
 
 /**
@@ -128,6 +129,85 @@ export function isRmCommand(command: string): boolean {
 
 const RM_COMMAND_RE =
   /(^|[\s;&|(])(?:(?:sudo|command|env(?:\s+-[A-Za-z0-9_]+)?)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*\\?rm(?=\s|$)/m
+
+/**
+ * Targets of an `rm` command that fall outside the workspace root
+ * (2026-10-30 用户授权: 工作区内 rm 放行，工作区外仍硬禁).
+ *
+ * Returns the offending raw targets; an empty array means the deletion is
+ * confined to the workspace and may proceed. Deliberately conservative —
+ * anything the parser cannot pin down (no target, unparseable quoting,
+ * `git rm` / `docker rm` subcommands, root or home targets, deletions of the
+ * workspace root itself) is reported as offending, so the caller keeps the
+ * hard block for the ambiguous cases.
+ */
+export function rmTargetsOutside(command: string, cwd: string, home: string): string[] {
+  const segments = command.split(/&&|\|\||;|\|/)
+  const offending: string[] = []
+  // A preceding `cd` invalidates the workspace-root assumption for every later
+  // segment, so those rm targets are reported instead of resolved lexically.
+  let cwdChanged = false
+  for (const segment of segments) {
+    const tokens = tokenizeShell(segment)
+    const rmIndex = tokens.findIndex(t => t === 'rm' || t === '\\rm')
+    if (rmIndex === -1) {
+      if (tokens[0] === 'cd' || tokens[0] === 'pushd') cwdChanged = true
+      continue
+    }
+    // `git rm` / `docker rm` / `find -delete` style subcommands are not plain
+    // rm: the argument shape differs, so keep them hard-blocked.
+    const before = tokens.slice(0, rmIndex)
+    if (before.includes('git') || before.includes('docker') || before.includes('find')) {
+      offending.push(tokens.slice(rmIndex).join(' '))
+      continue
+    }
+    const targets = tokens.slice(rmIndex + 1).filter(t => !t.startsWith('-'))
+    if (targets.length === 0) {
+      offending.push('(无目标)')
+      continue
+    }
+    if (cwdChanged) {
+      offending.push(...targets)
+      continue
+    }
+    for (const raw of targets) {
+      const expanded = raw.startsWith('~') ? path.join(home, raw.slice(1)) : raw
+      const absolute = path.resolve(cwd, expanded)
+      const normalized = path.normalize(absolute)
+      const relative = path.relative(cwd, normalized)
+      const outside = relative === '' || relative.startsWith('..') || path.isAbsolute(relative)
+      const isRoot = normalized === '/' 
+      const isHome = normalized === path.normalize(home)
+      if (outside || isRoot || isHome) offending.push(raw)
+    }
+  }
+  return offending
+}
+
+/** Minimal shell tokenizer: splits on whitespace, honours single/double quotes. */
+export function tokenizeShell(text: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  for (const char of text.trim()) {
+    if (quote !== null) {
+      if (char === quote) quote = null
+      else current += char
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (/\s/.test(char)) {
+      if (current !== '') { tokens.push(current); current = '' }
+      continue
+    }
+    current += char
+  }
+  if (current !== '') tokens.push(current)
+  return tokens
+}
 
 /**
  * Shell tools eligible for the readonly fail-open branch. Subset of
@@ -260,7 +340,7 @@ export interface VerdictInput {
   readonly toolName: string
   /** Parsed classifier output; null when the classifier failed or was unreadable. */
   readonly output: ClassifierOutput | null
-  readonly config: Pick<ResolvedGuardConfig, 'fallback' | 'diagnosticFallback'>
+  readonly config: Pick<ResolvedGuardConfig, 'fallback' | 'diagnosticFallback' | 'codeClassFallback'>
   /** Shell command text for code-class shell tools (null for non-shell tools). */
   readonly shellCommand?: string | null
 }
@@ -338,10 +418,13 @@ export function resolveVerdict(input: VerdictInput): PolicyVerdict {
     }
   }
   if (CODE_CLASS_TOOLS.has(toolName)) {
+    const mode = config.codeClassFallback ?? 'close'
     return {
-      verdict: 'block',
-      reason: 'classifier unavailable; code-class tool fails close',
-      delegateTo: 'code-agent',
+      verdict: mode === 'open' ? 'allow' : 'block',
+      reason: mode === 'open'
+        ? 'classifier unavailable; code-class fail-open (codeClassFallback=open)'
+        : 'classifier unavailable; code-class tool fails close',
+      delegateTo: mode === 'open' ? null : 'code-agent',
       reviewPrompt: null,
       classifierFailed: true,
       toolName,

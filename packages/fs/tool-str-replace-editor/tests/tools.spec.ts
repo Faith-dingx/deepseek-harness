@@ -1,20 +1,24 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { FsVersion } from '@deepseek-ai/dsh-fs'
-import { CallId } from '@deepseek-ai/dsh-llm'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 import * as FsPolicy from '@deepseek-ai/dsh-fs-observation-policy'
 import SandboxedFileSystem from '@deepseek-ai/dsh-fs-sandbox'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import * as ToolStrReplaceEditor from '@deepseek-ai/dsh-tool-str-replace-editor'
+import { unsupportedModel, unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
 
 const contexts: Context[] = []
 const roots: string[] = []
@@ -25,15 +29,18 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
 
-function agent(ctx: Context, cwd: string): Agent {
+async function agent(ctx: Context, cwd: string): Promise<Agent> {
   const id = SessionId(`str-replace-editor-owner-${callNumber}`)
   const scope = ctx.plugin(() => {})
-  const session = Session.create(id, [], { version: 0, id, createdAt: 0, cwd })
+  const session = Session.create(id, [], {
+    version: SESSION_FORMAT_VERSION, id, createdAt: 0, cwd, isSeeded: false,
+  })
   const value: Agent = {
     id,
     options: {},
     session,
-    inbox: new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} }),
+    model: unsupportedModel(),
+    inbox: unsupportedInbox(),
     status: 'idle',
     ctx: scope.ctx,
     send: () => {},
@@ -44,7 +51,7 @@ function agent(ctx: Context, cwd: string): Agent {
     runMaintenance: task => task(new AbortController().signal),
     whenIdle: () => Promise.resolve(),
   }
-  ctx.agents.register(value)
+  await ctx.agents.register(value)
   return value
 }
 
@@ -53,9 +60,9 @@ function text(result: { content: { type: string; text?: string }[] }): string {
 }
 
 function call(ctx: Context, owner: Agent | undefined, args: unknown) {
-  return ctx.tools.execute({
+  return executeToolFixture(ctx, {
     signal: new AbortController().signal,
-    callId: CallId(`str-replace-editor-${++callNumber}`),
+    callId: ToolCallId(`str-replace-editor-${++callNumber}`),
     name: 'str_replace_editor',
     arguments: args,
     ...owner === undefined ? {} : { agent: owner },
@@ -64,14 +71,16 @@ function call(ctx: Context, owner: Agent | undefined, args: unknown) {
 
 async function setup(
   config: ToolStrReplaceEditor.Config = {},
-  options: { fsPolicy?: boolean; sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access' } = {},
+  options: { fsPolicy?: boolean; sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access'; root?: string } = {},
 ) {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-tool-str-replace-editor-'))
-  roots.push(root)
+  const root = options.root ?? await mkdtemp(join(tmpdir(), 'dsh-tool-str-replace-editor-'))
+  if (options.root === undefined) roots.push(root)
   const ctx = new Context()
   contexts.push(ctx)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(AgentRegistry)
   if (options.sandboxMode === undefined) {
     await ctx.plugin(LocalFileSystem, { cwd: root })
@@ -81,7 +90,7 @@ async function setup(
   }
   if (options.fsPolicy === true) await ctx.plugin(FsPolicy)
   const fiber = await ctx.plugin(ToolStrReplaceEditor, config)
-  return { ctx, root, fiber, owner: agent(ctx, root) }
+  return { ctx, root, fiber, owner: await agent(ctx, root) }
 }
 
 describe('tool-str-replace-editor', () => {
@@ -91,14 +100,27 @@ describe('tool-str-replace-editor', () => {
     expect(ctx.tools.schemas().map(item => item.name)).toEqual(['str_replace_editor'])
     expect(schema?.description).toBe('custom editor description')
     const properties = (schema?.parameters as {
-      properties: Record<string, { type?: string; items?: { type?: string } }>
+      properties: Record<string, {
+        type?: string
+        items?: { type?: string }
+        oneOf?: { type?: string; items?: { type?: string } }[]
+      }>
     }).properties
     expect(properties).not.toHaveProperty('replace_all')
-    expect(properties.insert_line?.type).toBe('integer')
-    expect(properties.view_range?.items?.type).toBe('integer')
+    expect(properties.file_text?.oneOf?.map(option => option.type)).toEqual(['string', 'null'])
+    expect(properties.insert_line?.oneOf?.map(option => option.type)).toEqual(['integer', 'null'])
+    expect(properties.new_str?.oneOf?.map(option => option.type)).toEqual(['string', 'null'])
+    expect(properties.old_str?.oneOf?.map(option => option.type)).toEqual(['string', 'null'])
+    expect(properties.view_range?.oneOf?.map(option => option.type)).toEqual(['array', 'null'])
+    expect(properties.view_range?.oneOf?.[0]?.items?.type).toBe('integer')
     expect(ctx.tools.get('str_replace_editor')?.presentCall?.({
       command: 'view',
       path: '/workspace/a.txt',
+      file_text: null,
+      insert_line: null,
+      new_str: null,
+      old_str: null,
+      view_range: null,
     })).toMatchObject({
       card: 'generic',
       kind: 'read',
@@ -108,6 +130,10 @@ describe('tool-str-replace-editor', () => {
       command: 'create',
       path: '/workspace/a.txt',
       file_text: 'hello',
+      insert_line: null,
+      new_str: null,
+      old_str: null,
+      view_range: null,
     })).toMatchObject({
       card: 'diff',
       diffs: [{ path: '/workspace/a.txt', oldText: null, newText: 'hello' }],
@@ -117,6 +143,9 @@ describe('tool-str-replace-editor', () => {
       path: '/workspace/a.txt',
       old_str: 'old',
       new_str: 'new',
+      file_text: null,
+      insert_line: null,
+      view_range: null,
     })).toMatchObject({
       card: 'diff',
       diffs: [{ path: '/workspace/a.txt', oldText: 'old', newText: 'new' }],
@@ -124,8 +153,21 @@ describe('tool-str-replace-editor', () => {
     expect(ctx.tools.get('str_replace_editor')?.presentCall?.({
       command: 'insert',
       path: '/workspace/a.txt',
+      insert_line: null,
+      new_str: 'x',
+    })).toMatchObject({
+      card: 'generic',
+      kind: 'edit',
+      locations: [{ path: '/workspace/a.txt' }],
+    })
+    expect(ctx.tools.get('str_replace_editor')?.presentCall?.({
+      command: 'insert',
+      path: '/workspace/a.txt',
       insert_line: 0,
       new_str: 'x',
+      file_text: null,
+      old_str: null,
+      view_range: null,
     })).toMatchObject({
       card: 'generic',
       kind: 'edit',
@@ -162,7 +204,21 @@ describe('tool-str-replace-editor', () => {
       command: 'create',
       path: sample,
       file_text: 'one\ntwo\nthree\n',
+      insert_line: null,
+      new_str: null,
+      old_str: null,
+      view_range: null,
     }))).toBe(`New file created successfully at: ${sample}`)
+
+    expect(text(await call(ctx, owner, {
+      command: 'view',
+      path: sample,
+      file_text: null,
+      insert_line: null,
+      new_str: null,
+      old_str: null,
+      view_range: null,
+    }))).toContain('     2  two')
 
     expect(text(await call(ctx, owner, {
       command: 'view',
@@ -181,6 +237,9 @@ describe('tool-str-replace-editor', () => {
       path: sample,
       old_str: 'two',
       new_str: 'TWO',
+      file_text: null,
+      insert_line: null,
+      view_range: null,
     }))).toBe(`The file ${sample} has been edited successfully.`)
     expect(text(await call(ctx, owner, {
       command: 'str_replace',
@@ -192,6 +251,9 @@ describe('tool-str-replace-editor', () => {
       path: sample,
       insert_line: 1,
       new_str: 'between',
+      file_text: null,
+      old_str: null,
+      view_range: null,
     }))).toBe(`The file ${sample} has been edited successfully.`)
     expect(await readFile(sample, 'utf8')).toBe('one\nbetween\n\nthree\n')
   })
@@ -285,6 +347,23 @@ describe('tool-str-replace-editor', () => {
       path: join(clipped.root, 'large.txt'),
     })))
       .toContain('<response clipped>')
+  })
+
+  it('clips a view at a code-unit boundary without splitting a surrogate pair', async () => {
+    const wide = await setup({ maxOutputChars: 10_000 })
+    const file = join(wide.root, 'emoji.txt')
+    await writeFile(file, `${'😀'.repeat(4)}tail`)
+    const untruncated = text(await call(wide.ctx, wide.owner, { command: 'view', path: file }))
+    // The cap lands on the high surrogate of the first emoji.
+    const splitAt = untruncated.indexOf('😀') + 1
+
+    // Share the renderer's root so the clipped context reads the file inside its
+    // own working directory.
+    const clipped = await setup({ maxOutputChars: splitAt }, { root: wide.root })
+    const rendered = text(await call(clipped.ctx, clipped.owner, { command: 'view', path: file }))
+
+    expect(rendered.startsWith(`${untruncated.slice(0, splitAt - 1)}<response clipped>`)).toBe(true)
+    expect(rendered).not.toContain('\uD83D')
   })
 
   it('matches canonical empty-line, range, and end-insert behavior', async () => {
@@ -381,6 +460,7 @@ describe('tool-str-replace-editor', () => {
     const relative = await call(ctx, owner, { command: 'view', path: 'ambiguous.txt' })
     expect(relative.isError).toBe(true)
     expect(text(relative)).toContain('is not an absolute path')
+    expect(relative.error?.info).toEqual({ name: 'ToolArgsError', code: 'INVALID_ARGS' })
     expect(await readFile(ambiguous, 'utf8')).toBe('alpha\nbeta\nmiddle\nalpha\nbeta')
   })
 
@@ -397,28 +477,38 @@ describe('tool-str-replace-editor', () => {
     await writeFile(threeLines, 'one\ntwo\nthree')
     await mkdir(directory)
 
-    const cases = [
-      { command: 'view', path: '' },
-      { command: 'view', path: join(root, 'missing.txt') },
-      { command: 'view', path: ambiguous, view_range: [1] },
-      { command: 'view', path: ambiguous, view_range: [0, 1] },
-      { command: 'view', path: ambiguous, view_range: [1.5, 2] },
-      { command: 'view', path: threeLines, view_range: [1, 99] },
-      { command: 'view', path: threeLines, view_range: [2, 1] },
-      { command: 'view', path: directory, view_range: [1, 1] },
-      { command: 'create', path: join(root, 'new.txt') },
-      { command: 'create', path: ambiguous, file_text: 'overwrite' },
-      { command: 'str_replace', path: ambiguous, new_str: 'x' },
-      { command: 'str_replace', path: ambiguous, old_str: '', new_str: 'x' },
-      { command: 'insert', path: ambiguous, new_str: 'x' },
-      { command: 'insert', path: ambiguous, insert_line: -1, new_str: 'x' },
-      { command: 'insert', path: ambiguous, insert_line: 1.5, new_str: 'x' },
-      { command: 'insert', path: ambiguous, insert_line: 99, new_str: 'x' },
-      { command: 'insert', path: empty, insert_line: 2, new_str: 'x' },
-      { command: 'insert', path: directory, insert_line: 0, new_str: 'x' },
+    const args = { name: 'ToolArgsError', code: 'INVALID_ARGS' }
+    const cases: [Record<string, unknown>, { name: string; code: string }][] = [
+      [{ command: null, path: ambiguous }, args],
+      [{ command: 'view', path: null }, args],
+      [{ command: 'view', path: '' }, args],
+      [{ command: 'view', path: join(root, 'missing.txt') }, { name: 'FsError', code: 'FS_NOT_FOUND' }],
+      [{ command: 'view', path: ambiguous, view_range: [1] }, args],
+      [{ command: 'view', path: ambiguous, view_range: [0, 1] }, args],
+      [{ command: 'view', path: ambiguous, view_range: [1.5, 2] }, args],
+      [{ command: 'view', path: threeLines, view_range: [1, 99] }, args],
+      [{ command: 'view', path: threeLines, view_range: [2, 1] }, args],
+      [{ command: 'view', path: directory, view_range: [1, 1] }, args],
+      [{ command: 'create', path: join(root, 'new.txt') }, args],
+      [{ command: 'create', path: join(root, 'new.txt'), file_text: null }, args],
+      [{ command: 'create', path: ambiguous, file_text: 'overwrite' }, { name: 'FsError', code: 'FS_ALREADY_EXISTS' }],
+      [{ command: 'str_replace', path: ambiguous, new_str: 'x' }, args],
+      [{ command: 'str_replace', path: ambiguous, old_str: null, new_str: 'x' }, args],
+      [{ command: 'str_replace', path: ambiguous, old_str: 'same same', new_str: null }, args],
+      [{ command: 'str_replace', path: ambiguous, old_str: '', new_str: 'x' }, args],
+      [{ command: 'insert', path: ambiguous, new_str: 'x' }, args],
+      [{ command: 'insert', path: ambiguous, insert_line: null, new_str: 'x' }, args],
+      [{ command: 'insert', path: ambiguous, insert_line: 0, new_str: null }, args],
+      [{ command: 'insert', path: ambiguous, insert_line: -1, new_str: 'x' }, args],
+      [{ command: 'insert', path: ambiguous, insert_line: 1.5, new_str: 'x' }, args],
+      [{ command: 'insert', path: ambiguous, insert_line: 99, new_str: 'x' }, args],
+      [{ command: 'insert', path: empty, insert_line: 2, new_str: 'x' }, args],
+      [{ command: 'insert', path: directory, insert_line: 0, new_str: 'x' }, { name: 'FsError', code: 'FS_NOT_REGULAR_FILE' }],
     ]
-    for (const args of cases) {
-      expect((await call(ctx, owner, args)).isError).toBe(true)
+    for (const [callArgs, info] of cases) {
+      const result = await call(ctx, owner, callArgs)
+      expect(result.isError).toBe(true)
+      expect({ args: callArgs, info: result.error?.info }).toEqual({ args: callArgs, info })
     }
     expect(await readFile(ambiguous, 'utf8')).toBe('same same')
 
@@ -532,12 +622,32 @@ describe('tool-str-replace-editor', () => {
     contexts.push(ctx)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(LocalFileSystem, { cwd: root })
     Object.defineProperty(ctx.fs, 'sandboxMode', { value: 'read-only' })
 
     await expect(ctx.plugin(ToolStrReplaceEditor))
       .rejects.toThrow('the mounted filesystem confines but ctx.sandboxPolicy is missing')
+  })
+
+  it('reports a file created after the absence check as FS_ALREADY_EXISTS', async () => {
+    const { ctx, root, owner } = await setup()
+    const path = join(root, 'raced.txt')
+    await writeFile(path, 'concurrent')
+    const stat = ctx.fs.stat.bind(ctx.fs)
+    let first = true
+    ctx.fs.stat = async (target, signal) => {
+      if (!first) return stat(target, signal)
+      first = false
+      return undefined
+    }
+    const result = await call(ctx, owner, { command: 'create', path, file_text: 'mine' })
+    expect(result.isError).toBe(true)
+    expect(result.error?.info).toEqual({ name: 'FsError', code: 'FS_ALREADY_EXISTS' })
+    expect(text(result)).toContain(`File already exists at: ${path}`)
+    expect(await readFile(path, 'utf8')).toBe('concurrent')
   })
 
   it('maps unexpected backend write failures for replace and insert', async () => {

@@ -8,10 +8,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { FsError } from '@deepseek-ai/dsh-fs'
 import type { FsInfo, FsTarget, FsWriteIntent } from '@deepseek-ai/dsh-fs'
+import { truncateWithoutSplittingSurrogatePair } from '@deepseek-ai/dsh-output-retention'
 import { sandboxDenialMarker } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { ToolArgsError, defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolCallView, ToolRunContext } from '@deepseek-ai/dsh-tools'
 
 const TRUNCATED_MESSAGE = '<response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>'
@@ -22,6 +23,7 @@ Custom editing tool for viewing, creating and editing files
 * If \`path\` is a file, \`view\` displays the result of applying \`cat -n\`. If \`path\` is a directory, \`view\` lists non-hidden files and directories up to 2 levels deep
 * The \`create\` command cannot be used if the specified \`path\` already exists as a file
 * If a \`command\` generates a long output, it will be truncated and marked with \`<response clipped>\`
+* A null placeholder for a parameter unused by the selected command is treated as omitted. Required parameters still need values; omit \`str_replace.new_str\` rather than setting it to null when deleting a match
 
 Notes for using the \`str_replace\` command:
 * The \`old_str\` parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
@@ -32,7 +34,7 @@ Notes for using the \`str_replace\` command:
 function maybeTruncate(content: string, maxOutputChars: number): string {
   return content.length <= maxOutputChars
     ? content
-    : content.slice(0, maxOutputChars) + TRUNCATED_MESSAGE
+    : truncateWithoutSplittingSurrogatePair(content, maxOutputChars) + TRUNCATED_MESSAGE
 }
 
 function codepointCompare(left: string, right: string): number {
@@ -90,9 +92,9 @@ async function resolveTarget(
   path: string,
   signal: AbortSignal,
 ): Promise<FsTarget> {
-  if (path.trim().length === 0) throw new Error('path must be a non-empty string')
+  if (path.trim().length === 0) throw new ToolArgsError(['path must be a non-empty string'])
   if (!isAbsolute(path)) {
-    throw new Error(`The path ${path} is not an absolute path, it should start with \`/\`. Maybe you meant /${path}?`)
+    throw new ToolArgsError([`The path ${path} is not an absolute path, it should start with \`/\`. Maybe you meant /${path}?`])
   }
   return ctx.fs.resolve(path, { signal })
 }
@@ -126,9 +128,9 @@ function requiredForCommand(
   command: string,
   allowEmpty = true,
 ): string {
-  if (value === undefined) throw new Error(`Parameter \`${parameter}\` is required for command: ${command}`)
+  if (value === undefined) throw new ToolArgsError([`Parameter \`${parameter}\` is required for command: ${command}`])
   if (!allowEmpty && value.length === 0) {
-    throw new Error(`Parameter \`${parameter}\` is empty for command: ${command}`)
+    throw new ToolArgsError([`Parameter \`${parameter}\` is empty for command: ${command}`])
   }
   return value
 }
@@ -152,24 +154,24 @@ function formatFileView(
       || requestedFinalLine === undefined
       || !viewRange.every(Number.isInteger)
     ) {
-      throw new Error('Invalid `view_range`. It should be a list of two integers.')
+      throw new ToolArgsError(['Invalid `view_range`. It should be a list of two integers.'])
     }
     initialLine = requestedInitialLine
     finalLine = requestedFinalLine
     if (initialLine < 1 || initialLine > allLines.length) {
-      throw new Error(
+      throw new ToolArgsError([
         `Invalid \`view_range\`: [${viewRange.join(', ')}]. Its first element \`${initialLine}\` should be within the range of lines of the file: [1, ${allLines.length}]`,
-      )
+      ])
     }
     if (finalLine > allLines.length) {
-      throw new Error(
+      throw new ToolArgsError([
         `Invalid \`view_range\`: [${viewRange.join(', ')}]. Its second element \`${finalLine}\` should be smaller than the number of lines in the file: \`${allLines.length}\``,
-      )
+      ])
     }
     if (finalLine !== -1 && finalLine < initialLine) {
-      throw new Error(
+      throw new ToolArgsError([
         `Invalid \`view_range\`: [${viewRange.join(', ')}]. Its second element \`${finalLine}\` should be larger or equal than its first \`${initialLine}\``,
-      )
+      ])
     }
     lines = finalLine === -1
       ? allLines.slice(initialLine - 1)
@@ -224,7 +226,7 @@ async function viewPath(
   const info = await statExisting(ctx, target, 'view', exec)
   if (info.type === 'directory') {
     if (viewRange !== undefined) {
-      throw new Error('The `view_range` parameter is not allowed when `path` points to a directory.')
+      throw new ToolArgsError(['The `view_range` parameter is not allowed when `path` points to a directory.'])
     }
     return listDirectory(ctx, target, maxOutputChars, exec)
   }
@@ -246,9 +248,12 @@ async function createFile(
   const content = requiredForCommand(fileText, 'file_text', 'create')
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
-  if (await ctx.fs.stat(target, exec.signal) !== undefined) {
-    throw new Error(`File already exists at: ${target.displayPath}. Cannot overwrite files using command \`create\`.`)
-  }
+  const alreadyExists = (cause?: FsError) => new FsError(
+    `File already exists at: ${target.displayPath}. Cannot overwrite files using command \`create\`.`,
+    'FS_ALREADY_EXISTS',
+    cause === undefined ? undefined : { cause },
+  )
+  if (await ctx.fs.stat(target, exec.signal) !== undefined) throw alreadyExists()
   const intent = await ctx.waterfall(
     'fs/write-intent',
     target,
@@ -265,6 +270,8 @@ async function createFile(
       sandboxPolicy,
     )
   } catch (error: unknown) {
+    // A file created after the absence check makes guarded creation report it as unread.
+    if (error instanceof FsError && error.code === 'FS_NOT_OBSERVED') throw alreadyExists(error)
     throw policy.mapError(error, sandboxPolicy)
   }
   ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
@@ -276,9 +283,12 @@ async function replaceInFile(
   policy: MutationPolicy,
   path: string,
   oldStr: string | undefined,
-  newStr: string | undefined,
+  newStr: string | null | undefined,
   exec: ToolRunContext,
 ): Promise<string> {
+  if (newStr === null) {
+    throw new ToolArgsError(['Parameter `new_str` must be omitted or contain a string for command: str_replace'])
+  }
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
   const intent = await ctx.waterfall('fs/edit-intent', target, exec, () => undefined)
@@ -330,7 +340,7 @@ async function insertInFile(
   newStr: string | undefined,
   exec: ToolRunContext,
 ): Promise<string> {
-  if (insertLine === undefined) throw new Error('Parameter `insert_line` is required for command: insert')
+  if (insertLine === undefined) throw new ToolArgsError(['Parameter `insert_line` is required for command: insert'])
   const value = requiredForCommand(newStr, 'new_str', 'insert')
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
@@ -342,9 +352,9 @@ async function insertInFile(
   const before = await ctx.fs.readText(target, exec.signal)
   const lines = before.split('\n')
   if (!Number.isInteger(insertLine) || insertLine < 0 || insertLine > lines.length) {
-    throw new Error(
+    throw new ToolArgsError([
       `Invalid \`insert_line\` parameter: ${insertLine}. It should be within the range of lines of the file: [0, ${lines.length}]`,
-    )
+    ])
   }
   const after = [
     ...lines.slice(0, insertLine),
@@ -372,10 +382,10 @@ interface ResolvedConfig {
 function presentEditorCall(args: {
   command: 'view' | 'create' | 'str_replace' | 'insert'
   path: string
-  file_text?: string
-  insert_line?: number
-  new_str?: string
-  old_str?: string
+  file_text?: string | null
+  insert_line?: number | null
+  new_str?: string | null
+  old_str?: string | null
 }): ToolCallView {
   switch (args.command) {
     case 'view':
@@ -410,7 +420,9 @@ function presentEditorCall(args: {
         kind: 'edit',
         locations: [{
           path: args.path,
-          ...args.insert_line === undefined ? {} : { line: Math.max(1, args.insert_line + 1) },
+          ...args.insert_line === undefined || args.insert_line === null
+            ? {}
+            : { line: Math.max(1, args.insert_line + 1) },
         }],
       }
   }
@@ -435,25 +447,27 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
         description: 'Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.',
       },
       file_text: {
-        type: 'string',
-        description: 'Required parameter of `create` command, with the content of the file to be created.',
+        oneOf: [{ type: 'string' }, { type: 'null' }],
+        description: 'Required string parameter of `create` command, with the content of the file to be created. A null placeholder is treated as omitted by commands that do not use this parameter.',
       },
       insert_line: {
-        type: 'integer',
-        description: 'Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.',
+        oneOf: [{ type: 'integer' }, { type: 'null' }],
+        description: 'Required integer parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`. A null placeholder is treated as omitted by commands that do not use this parameter.',
       },
       new_str: {
-        type: 'string',
-        description: 'Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert.',
+        oneOf: [{ type: 'string' }, { type: 'null' }],
+        description: 'Optional string parameter of `str_replace` command containing the new string (if omitted, no string will be added). Required string parameter of `insert` command containing the string to insert. A null placeholder is accepted only by commands that do not use this parameter.',
       },
       old_str: {
-        type: 'string',
-        description: 'Required parameter of `str_replace` command containing the string in `path` to replace.',
+        oneOf: [{ type: 'string' }, { type: 'null' }],
+        description: 'Required string parameter of `str_replace` command containing the string in `path` to replace. A null placeholder is treated as omitted by commands that do not use this parameter.',
       },
       view_range: {
-        type: 'array',
-        items: { type: 'integer' },
-        description: 'Optional parameter of `view` command when `path` points to a file. If none is given, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.',
+        oneOf: [
+          { type: 'array', items: { type: 'integer' } },
+          { type: 'null' },
+        ],
+        description: 'Optional parameter of `view` command when `path` points to a file. If omitted or null, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.',
       },
     },
     output: {
@@ -463,15 +477,15 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
     async execute(args, exec) {
       switch (args.command) {
         case 'view':
-          return viewPath(ctx, args.path, args.view_range, config.maxOutputChars, exec)
+          return viewPath(ctx, args.path, args.view_range ?? undefined, config.maxOutputChars, exec)
         case 'create':
-          return createFile(ctx, policy, args.path, args.file_text, exec)
+          return createFile(ctx, policy, args.path, args.file_text ?? undefined, exec)
         case 'str_replace':
           return replaceInFile(
             ctx,
             policy,
             args.path,
-            args.old_str,
+            args.old_str ?? undefined,
             args.new_str,
             exec,
           )
@@ -480,8 +494,8 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
             ctx,
             policy,
             args.path,
-            args.insert_line,
-            args.new_str,
+            args.insert_line ?? undefined,
+            args.new_str ?? undefined,
             exec,
           )
       }

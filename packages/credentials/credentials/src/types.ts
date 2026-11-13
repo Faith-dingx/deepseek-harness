@@ -1,8 +1,9 @@
 /**
  * Client-safe type surface of the credential seam: the two key brands, the
- * stored-record union, and the seam's Cordis event declarations. Types only —
- * no runtime code, and nothing here reaches a Host-only symbol, so a Client
- * compilation face reads exactly the signature the Host emits.
+ * stored-record union, the reference view crossing the Remote wire, and the
+ * seam's Cordis event declarations. Types only — no runtime code, and nothing
+ * here reaches a Host-only symbol, so a Client compilation face reads exactly
+ * the signature the Host emits.
  *
  * @module @deepseek-ai/dsh-credentials/types
  */
@@ -58,6 +59,21 @@ export interface GrantRecord {
 /** One durable credential record, tagged by what the seam may do with it. */
 export type CredentialRecord = ApiKeyRecord | GrantRecord
 
+/**
+ * Configuration facts and an optional provider-masked preview for one
+ * reference. The full credential is never part of this view.
+ */
+export interface CredentialInfo {
+  /** Whether resolving the reference would currently return a value. */
+  configured: boolean
+  /** Source layer currently supplying the value; absent while unconfigured. */
+  source?: string
+  /** Whether the active provider can write this reference. */
+  writable: boolean
+  /** Provider-generated masked preview of a stored value; never the full value. */
+  masked?: string
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /**
@@ -65,10 +81,7 @@ declare module '@deepseek-ai/cordis' {
      * `unset`, or an external edit observed in storage. Ambient
      * process-environment changes are not observable and never emit. Listener
      * failures are contained and logged — a sync throw and an async rejection
-     * alike — without changing the committed operation's outcome, except
-     * `INVARIANT`-coded failures, which rethrow after every listener ran;
-     * that rethrow reaches the emitter only from synchronous listeners, so
-     * invariant checks on this event must not be async functions.
+     * alike — without changing the committed operation's outcome.
      * @param ref - the reference whose stored value changed.
      * @mode emit
      */

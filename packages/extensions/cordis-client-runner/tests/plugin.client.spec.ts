@@ -3,24 +3,22 @@
  *
  * Plugin composition account: the dispatch family reaches the runner with its
  * envelope rpcId, the service face is provided for UI surfaces, a load failure
- * always reaches the console, and the fiber owns the runner's teardown. Plus the two plane-level companions: the
- * node half's empty apply and the invariant registration.
+ * always reaches the console, the fiber owns the runner's teardown, and the
+ * node half remains inert.
  */
 /* oxlint-disable typescript/no-unsafe-assignment -- Vitest asymmetric matchers are typed as any. */
 
 import { Context } from '@deepseek-ai/cordis'
+import { TimerService } from '@deepseek-ai/cordis-plugin-timer'
 import { describe, expect, it, vi } from 'vitest'
-import InvariantService from '@deepseek-ai/dsh-invariants'
 import type {
   ApprovalRequestId, CordisDynamicPackageId, CordisDynamicPluginId, CordisDynamicPluginRunId,
+  DynamicCordisInvokeResult, SessionId,
 } from '@deepseek-ai/dsh-api-remotes/client'
-import type { SessionId } from '@deepseek-ai/dsh-client-connection/client'
-import type { DynamicCordisInvokeResult } from '@deepseek-ai/dsh-api-remotes/client'
-// Type-only: resolves `ctx.remote` and with it the `$on`/`$dispatch` surface.
+// Type-only: resolves the `ctx.remote.$on` surface.
 import type {} from '@deepseek-ai/dsh-api-gateway/client'
-import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
+import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import * as NodeHalf from '../src/index.ts'
-import * as Invariant from '../src/invariant.ts'
 import * as ClientHalf from '../src/client/index.ts'
 
 const PLUGIN = 'dyn-1' as CordisDynamicPluginId
@@ -29,15 +27,6 @@ const RUN = 'run-1' as CordisDynamicPluginRunId
 const AGENT = 's-1' as SessionId
 const USER_RUN = {
   agentId: AGENT, pluginId: PLUGIN, packageId: PACKAGE, mode: 'run' as const, hasClientHalf: true,
-}
-
-/**
- * Deliver one forwarded Host event the way the runtime's frame bridge does: the
- * bridge hands `host/remote-event` to the Remote service, which fans it out to
- * `$on` subscribers with the Host's own argument list.
- */
-function forward(ctx: Context, event: string, payload: object): void {
-  ctx.remote.$dispatch(event, [payload])
 }
 
 interface Bench {
@@ -67,6 +56,8 @@ interface Bench {
   }[]
   /** Whether the namespace refuses the next render-failure report. */
   reportRefused: { current: boolean }
+  /** Drive one forwarded Host event through the test-owned subscription table. */
+  forward: (event: string, payload: object) => void
   /**
    * Report one entry crash the way the renderer's boundary does. Production calls
    * this from ui-renderer's boundary through the render host; a test has no React
@@ -78,8 +69,7 @@ interface Bench {
 }
 
 /** Mount the browser half over a module table and a loader standing on real fibers. */
-async function boot(): Promise<Bench> {
-  const ctx = new Context()
+async function boot(ctx = new Context()): Promise<Bench> {
   await ctx.plugin(SlotRegistry)
   const factories = new Map<string, () => unknown>()
   const fibers = new Map<string, { fiber: unknown }>()
@@ -161,6 +151,11 @@ async function boot(): Promise<Bench> {
   // this plugin's subscriptions, so registration order and delivery are all the
   // stub owes (api-gateway covers isolation and disposal on the real one).
   const listeners = new Map<string, ((...args: never[]) => void)[]>()
+  const forward = (event: string, payload: object): void => {
+    for (const listener of [...listeners.get(event) ?? []]) {
+      (listener as (...args: readonly unknown[]) => void)(payload)
+    }
+  }
   const remote = {
     dynamicCordisRunner: namespace,
     $on: (event: string, listener: (...args: never[]) => void) => {
@@ -170,11 +165,6 @@ async function boot(): Promise<Bench> {
       return () => {
         const at = bucket.indexOf(listener)
         if (at >= 0) bucket.splice(at, 1)
-      }
-    },
-    $dispatch: (event: string, args: readonly unknown[]) => {
-      for (const listener of [...listeners.get(event) ?? []]) {
-        (listener as (...a: readonly unknown[]) => void)(...args)
       }
     },
   }
@@ -191,6 +181,7 @@ async function boot(): Promise<Bench> {
     invokeThrow,
     renderFailures,
     reportRefused,
+    forward,
     crash: (slot, entry, abdicate, error) => {
       const core = (ctx.slots as unknown as {
         _core: { reportEntryError(key: string, entry: unknown, error: unknown, info: { abdicate: boolean }): void }
@@ -203,6 +194,49 @@ async function boot(): Promise<Bench> {
 }
 
 describe('browser half', () => {
+  it('installs the shared Timer and disposes scheduled work with its consumer', async () => {
+    const moduleLoader = Object.getOwnPropertyDescriptor(globalThis, '__ModuleLoader__')
+    const ctx = new Context()
+    vi.useFakeTimers()
+    try {
+      const bench = await boot(ctx)
+      expect(bench.ctx.timer).toBeInstanceOf(TimerService)
+      const timeout = vi.fn()
+      const interval = vi.fn()
+      const delayed = vi.fn()
+      const consumer = bench.ctx.plugin({
+        inject: ['timer'],
+        apply(ctx: Context) {
+          ctx.timeout(timeout, 20)
+          ctx.interval(interval, 20)
+          ctx.debounce(delayed, 40)()
+        },
+      })
+      await consumer
+      await vi.advanceTimersByTimeAsync(20)
+      expect(timeout).toHaveBeenCalledOnce()
+      expect(interval).toHaveBeenCalledOnce()
+      expect(delayed).not.toHaveBeenCalled()
+      await consumer.dispose()
+      await vi.advanceTimersByTimeAsync(40)
+      expect(interval).toHaveBeenCalledOnce()
+      expect(delayed).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+      expect(bench.ctx.timer).toBeInstanceOf(TimerService)
+      await bench.dispose()
+      expect(bench.ctx.get('timer')).toBeUndefined()
+      expect(bench.ctx.timeout).toBeUndefined()
+    } finally {
+      try {
+        await ctx.fiber.dispose()
+      } finally {
+        vi.useRealTimers()
+        if (moduleLoader) Object.defineProperty(globalThis, '__ModuleLoader__', moduleLoader)
+        else Reflect.deleteProperty(globalThis, '__ModuleLoader__')
+      }
+    }
+  })
+
   it('provides the load engine as the page run-state face', async () => {
     const bench = await boot()
     expect(bench.ctx.dynamicCordisRunner.getSnapshot()).toEqual([])
@@ -213,7 +247,7 @@ describe('browser half', () => {
     const bench = await boot()
     await bench.ctx.dynamicCordisRunner.startUserRun(USER_RUN)
     expect(bench.ctx.dynamicCordisRunner.isLoaded(PLUGIN)).toBe(true)
-    forward(bench.ctx, 'cordis/dynamic-retract', {
+    bench.forward('cordis/dynamic-retract', {
       pluginId: PLUGIN, packageId: PACKAGE, pluginRunId: RUN,
     })
     await bench.settle()
@@ -350,7 +384,7 @@ describe('browser half', () => {
   it('answers a run request after the surface approves it', async () => {
     const bench = await boot()
     const request = 'rr-1' as ApprovalRequestId
-    forward(bench.ctx, 'cordis/request-run', {
+    bench.forward('cordis/request-run', {
       requestId: request,
       agentId: AGENT,
       pluginId: PLUGIN,
@@ -383,7 +417,7 @@ describe('browser half', () => {
   it('drops the affordance when another page answers the request', async () => {
     const bench = await boot()
     const request = 'rr-2' as ApprovalRequestId
-    forward(bench.ctx, 'cordis/request-run', {
+    bench.forward('cordis/request-run', {
       requestId: request,
       agentId: AGENT,
       pluginId: PLUGIN,
@@ -394,7 +428,7 @@ describe('browser half', () => {
       requiresApproval: true,
     })
     await bench.settle()
-    forward(bench.ctx, 'cordis/request-run-resolved', {
+    bench.forward('cordis/request-run-resolved', {
       requestId: request, outcome: 'approved',
     })
     await bench.settle()
@@ -407,7 +441,7 @@ describe('browser half', () => {
   it('exposes the refusal and the load observer on the face', async () => {
     const bench = await boot()
     const request = 'rr-3' as ApprovalRequestId
-    forward(bench.ctx, 'cordis/request-run', {
+    bench.forward('cordis/request-run', {
       requestId: request,
       agentId: AGENT,
       pluginId: PLUGIN,
@@ -442,19 +476,5 @@ describe('node half', () => {
   it('contributes nothing host-side', () => {
     NodeHalf.apply()
     expect(typeof NodeHalf.apply).toBe('function')
-  })
-})
-
-describe('invariant companion', () => {
-  it('reserves package ownership with an explained empty installer', async () => {
-    const ctx = new Context()
-    await ctx.plugin(InvariantService, { enabled: true })
-    const fiber = ctx.plugin(Invariant)
-    await fiber
-    expect(Invariant.name).toBe('cordis-client-runner-invariant')
-    // No relation to audit here: the owned one is browser-local runner state.
-    // An event this plugin declares nothing about: the bridge must not route it here.
-    expect(() => { (ctx.emit as (type: string) => void)('unrelated/event') }).not.toThrow()
-    await fiber.dispose()
   })
 })

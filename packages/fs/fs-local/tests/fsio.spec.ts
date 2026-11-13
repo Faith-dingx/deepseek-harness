@@ -8,15 +8,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { chmod, mkdtemp, readFile, rename, rm, stat, symlink, unlink, writeFile, mkdir, readdir, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, parse, relative, resolve } from 'node:path'
 import { createServer } from 'node:net'
 import {
   applyLiteralEdit,
   listDirectory,
   probe,
   probeNoFollow,
+  readByteWindow,
   readForEdit,
   readTextForDiff,
+  readWholeBytes,
   readWholeText,
   resolveLocalTarget,
   restoreLineEndings,
@@ -91,6 +93,50 @@ describe('resolveLocalTarget', () => {
 
   it('rejects a blank path', async () => {
     await expect(resolveLocalTarget(dir, '   ')).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+  })
+
+  it('anchors a relative cwd before retaining parent traversal in a display path', async () => {
+    await mkdir(join(dir, 'nested'))
+    const cwd = relative(process.cwd(), dir)
+    const target = await resolveLocalTarget(cwd, 'nested/../created.txt')
+    expect(isAbsolute(target.displayPath)).toBe(true)
+    expect(target.targetKey).toBe(join(await realpath(dir), 'created.txt'))
+    expect((await resolveLocalTarget(cwd, target.displayPath)).targetKey).toBe(target.targetKey)
+  })
+
+  it.skipIf(process.platform === 'win32')('rejects parent traversal through a missing directory hierarchy', async () => {
+    await expect(resolveLocalTarget(dir, 'missing/deeper/../created.txt')).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+  })
+
+  it.skipIf(process.platform !== 'win32')('preserves native drive-relative cwd and path resolution', async () => {
+    await mkdir(join(dir, 'nested'))
+    await writeFile(join(dir, 'created.txt'), 'native')
+    const drive = parse(dir).root.slice(0, 2)
+    // Resolve the temp drive independently when the checkout lives on another volume.
+    const driveCwd = `${drive}${relative(resolve(drive), dir)}`
+    for (const cwd of [dir, driveCwd]) {
+      for (const requested of ['created.txt', `${drive}nested/../created.txt`]) {
+        const target = await resolveLocalTarget(cwd, requested)
+        const expected = resolve(cwd, requested)
+        expect(target.displayPath).toBe(expected)
+        expect(target.targetKey).toBe(await realpath(expected))
+      }
+    }
+    const missing = await resolveLocalTarget(dir, 'missing/deeper/../created.txt')
+    expect(missing.targetKey).toBe(join(await realpath(dir), 'missing', 'created.txt'))
+  })
+
+  it.skipIf(process.platform === 'win32')('resolves parent traversal after a symlink in the provider filesystem', async () => {
+    const physical = join(dir, 'physical')
+    await mkdir(join(physical, 'nested'), { recursive: true })
+    await mkdir(join(dir, 'lexical'))
+    await symlink(join(physical, 'nested'), join(dir, 'lexical', 'link'))
+    const cwd = `${join(dir, 'lexical', 'link')}/..`
+    const before = await resolveLocalTarget(cwd, 'created.txt')
+    expect(before.targetKey).toBe(join(await realpath(physical), 'created.txt'))
+    await writeFile(join(physical, 'created.txt'), 'physical')
+    expect((await resolveLocalTarget(dir, 'lexical/link/../created.txt')).targetKey).toBe(before.targetKey)
+    await expect(resolveLocalTarget(dir, 'missing/../created.txt')).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
   })
 
   it('rejects a path whose ancestor is a file with a structured FsError (ENOTDIR)', async () => {
@@ -171,6 +217,22 @@ describe('probeNoFollow', () => {
 })
 
 describe('listDirectory', () => {
+  it.skipIf(process.platform === 'win32')('preserves physical parent traversal in displayed child paths', async () => {
+    const lexical = join(dir, 'lexical')
+    const physical = join(dir, 'physical')
+    await mkdir(lexical)
+    await mkdir(join(physical, 'nested'), { recursive: true })
+    await symlink(join(physical, 'nested'), join(lexical, 'link'))
+    await writeFile(join(lexical, 'same.txt'), 'lexical file')
+    await writeFile(join(physical, 'same.txt'), 'physical file')
+
+    const parent = await resolveLocalTarget(dir, 'lexical/link/..')
+    const entries = await listDirectory(parent)
+    const child = entries.find(entry => entry.name === 'same.txt')!
+    expect(await readFile(child.target.displayPath, 'utf8')).toBe('physical file')
+    expect((await resolveLocalTarget(dir, child.target.displayPath)).targetKey).toBe(child.target.targetKey)
+  })
+
   it('lists direct children in stable order without reading content', async () => {
     const root = join(dir, 'skills')
     await mkdir(join(root, 'dir-skill'), { recursive: true })
@@ -756,7 +818,7 @@ describe('writeFileAtomic — temp-file safety', () => {
       platform: 'win32',
       copyFileDacl: () => Promise.resolve(),
       replaceFile: async () => { throw denied },
-    })).rejects.toBe(denied)
+    })).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED', cause: denied })
     expect(await readFile(file, 'utf8')).toBe('old')
     expect((await readdir(dir)).filter(name => name.includes('.tmp'))).toEqual([])
   })
@@ -767,7 +829,7 @@ describe('writeFileAtomic — temp-file safety', () => {
 
     await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
       linkFile: async () => { throw denied },
-    }, { displayPath: file })).rejects.toMatchObject({ code: 'FS_IO_ERROR', cause: denied })
+    }, { displayPath: file, createIfAbsent: true })).rejects.toMatchObject({ code: 'FS_IO_ERROR', cause: denied })
     await expect(stat(file)).rejects.toMatchObject({ code: 'ENOENT' })
     expect((await readdir(dir)).filter(name => name.includes('.tmp'))).toEqual([])
   })
@@ -780,7 +842,7 @@ describe('writeFileAtomic — temp-file safety', () => {
     await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
       linkFile: async () => { throw linkFailure },
       inspectPublicationTarget: async () => { throw inspectionFailure },
-    }, { displayPath: file })).rejects.toMatchObject({ code: 'FS_IO_ERROR', cause: inspectionFailure })
+    }, { displayPath: file, createIfAbsent: true })).rejects.toMatchObject({ code: 'FS_IO_ERROR', cause: inspectionFailure })
     await expect(stat(file)).rejects.toMatchObject({ code: 'ENOENT' })
     expect((await readdir(dir)).filter(name => name.includes('.tmp'))).toEqual([])
   })
@@ -791,7 +853,7 @@ describe('writeFileAtomic — temp-file safety', () => {
 
     await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
       linkFile: async () => { throw collision },
-    }, { displayPath: file })).rejects.toMatchObject({
+    }, { displayPath: file, createIfAbsent: true })).rejects.toMatchObject({
       code: 'FS_NOT_OBSERVED',
       message: `cannot overwrite existing "${file}" without reading it first`,
       cause: collision,
@@ -806,7 +868,7 @@ describe('writeFileAtomic — temp-file safety', () => {
 
     await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
       inspectTemp: async () => { await writeFile(file, 'competitor') },
-    }, { displayPath })).rejects.toMatchObject({
+    }, { displayPath, createIfAbsent: true })).rejects.toMatchObject({
       code: 'FS_NOT_OBSERVED',
       message: `cannot overwrite existing "${displayPath}" without reading it first`,
     })
@@ -815,7 +877,7 @@ describe('writeFileAtomic — temp-file safety', () => {
     await rm(file)
     await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
       inspectTemp: async () => { await mkdir(file) },
-    }, { displayPath })).rejects.toMatchObject({
+    }, { displayPath, createIfAbsent: true })).rejects.toMatchObject({
       code: 'FS_NOT_REGULAR_FILE',
       message: `cannot write "${displayPath}": not a regular file`,
     })
@@ -828,7 +890,7 @@ describe('writeFileAtomic — temp-file safety', () => {
 
     await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
       removeStagingDir: async () => { throw cleanupFailure },
-    }, { displayPath: file })).resolves.toBeUndefined()
+    }, { displayPath: file, createIfAbsent: true })).resolves.toBeUndefined()
     expect(await readFile(file, 'utf8')).toBe('ours')
   })
 
@@ -845,7 +907,7 @@ describe('writeFileAtomic — temp-file safety', () => {
     await writeFile(join(dir, tempDirName, 'PRECIOUS'), 'keep')
     await expect(
       writeFileAtomic(file, 'hello', undefined, undefined, { tempDirName: () => tempDirName }),
-    ).rejects.toMatchObject({ code: 'EEXIST' })
+    ).rejects.toMatchObject({ code: 'FS_IO_ERROR', cause: { code: 'EEXIST' } })
     expect(await readFile(join(dir, tempDirName, 'PRECIOUS'), 'utf8')).toBe('keep')
     await expect(stat(file)).rejects.toMatchObject({ code: 'ENOENT' })
   })
@@ -919,6 +981,15 @@ describe('readForEdit + restoreLineEndings', () => {
     await expect(readForEdit(join(dir, 'bad'), join(dir, 'bad'))).rejects.toMatchObject({ code: 'FS_NOT_TEXT' })
   })
 
+  it('classifies a missing file and a directory read for editing', async () => {
+    await expect(readForEdit(join(dir, 'missing'), '~/missing')).rejects.toMatchObject({
+      name: 'FsError', code: 'FS_NOT_FOUND', message: 'cannot edit "~/missing": not found',
+    })
+    await expect(readForEdit(dir, '~/dir')).rejects.toMatchObject({
+      name: 'FsError', code: 'FS_NOT_REGULAR_FILE', message: 'cannot edit "~/dir": not a regular file',
+    })
+  })
+
   it('passes a live (non-aborted) signal through the read', async () => {
     const file = join(dir, 'a.txt')
     await writeFile(file, 'one\ntwo')
@@ -934,5 +1005,83 @@ describe('readForEdit + restoreLineEndings', () => {
     const pending = readForEdit(file, file, ac.signal)
     ac.abort()
     await expect(pending).rejects.toMatchObject({ code: 'FS_ABORTED' })
+  })
+})
+
+
+describe('atomic write failures', () => {
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('maps denied parent and staging creation to typed permission failures', async () => {
+    const locked = join(dir, 'locked')
+    await mkdir(locked, { mode: 0o555 })
+    try {
+      for (const target of [join(locked, 'file'), join(locked, 'missing', 'file')]) {
+        await expect(writeFileAtomic(target, 'content', undefined, undefined)).rejects.toMatchObject({
+          code: 'FS_PERMISSION_DENIED', message: `cannot write "${target}": permission denied`,
+        })
+        await expect(writeFileAtomic(target, 'content', undefined, undefined, {}, { displayPath: '~/shown' })).rejects.toMatchObject({
+          code: 'FS_PERMISSION_DENIED', message: 'cannot write "~/shown": permission denied',
+        })
+      }
+      expect(await readdir(locked)).toEqual([])
+    } finally { await chmod(locked, 0o755) }
+  })
+
+  it('maps a parent path blocked by a regular file to FS_IO_ERROR on every platform', async () => {
+    const blocker = join(dir, 'blocker')
+    await writeFile(blocker, 'file')
+    const target = join(blocker, 'child')
+    await expect(writeFileAtomic(target, 'content', undefined, undefined)).rejects.toMatchObject({
+      code: 'FS_IO_ERROR', message: expect.stringContaining(`cannot write "${target}": `) as string, cause: expect.any(Error) as Error,
+    })
+    expect(await readFile(blocker, 'utf8')).toBe('file')
+  })
+
+  it.each([new Error('provider defect'), Object.assign(new Error('invalid errno'), { code: 1 }), 'provider defect'])(
+    'preserves unexpected failures during staging: %s', async (failure) => {
+      const file = join(dir, 'a')
+      await expect(writeFileAtomic(file, 'new', undefined, undefined, {
+        inspectTemp: async () => { throw failure },
+      })).rejects.toBe(failure)
+      expect(await readdir(dir)).toEqual([])
+    },
+  )
+})
+
+describe('Node errno classification', () => {
+  it('classifies metadata, resolution, and read faults on a symlink loop', async () => {
+    const loop = join(dir, 'loop')
+    await symlink(loop, loop)
+    const ioError = { name: 'FsError', code: 'FS_IO_ERROR' }
+    await expect(probe(loop)).rejects.toMatchObject(ioError)
+    await expect(resolveLocalTarget(dir, 'loop')).rejects.toMatchObject(ioError)
+    await expect(readWholeText(localTarget(loop))).rejects.toMatchObject(ioError)
+  })
+
+  it('classifies a regular file replaced by a directory after the raw-read stat', async () => {
+    const file = join(dir, 'swap.bin')
+    await writeFile(file, 'bytes')
+    const failure = await readWholeBytes(localTarget(file), undefined, 1024, {
+      inspectReadBytesAfterStat: async () => {
+        await unlink(file)
+        await mkdir(file)
+      },
+    }).then(() => undefined, (caught: unknown) => caught)
+    expect(failure).toBeInstanceOf(FsError)
+    expect(failure).toMatchObject({ name: 'FsError', code: 'FS_NOT_REGULAR_FILE', cause: expect.objectContaining({ code: 'EISDIR' }) as Error })
+  })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('maps unreadable file content to FS_PERMISSION_DENIED', async () => {
+    const file = join(dir, 'locked.txt')
+    await writeFile(file, 'secret')
+    await chmod(file, 0o000)
+    try {
+      const denied = { name: 'FsError', code: 'FS_PERMISSION_DENIED', message: `cannot read "${file}": permission denied` }
+      await expect(readWholeText(localTarget(file))).rejects.toMatchObject(denied)
+      await expect(collect(streamWholeText(localTarget(file)))).rejects.toMatchObject(denied)
+      await expect(readByteWindow(localTarget(file), { offset: 0, length: 4 })).rejects.toMatchObject(denied)
+      await expect(readForEdit(file, file)).rejects.toMatchObject({ code: 'FS_PERMISSION_DENIED', message: `cannot edit "${file}": permission denied` })
+    } finally {
+      await chmod(file, 0o600)
+    }
   })
 })

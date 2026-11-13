@@ -2,7 +2,7 @@
  * Conversation context extraction from the live session log.
  *
  * `tools/pre-execute` hands the guard only the execution; the conversation
- * comes from the caller agent's session events (`agent.session.events`).
+ * comes from the caller agent's session events (`agent.session.snapshotEvents()`).
  * This module projects the last 5 rounds of user + assistant message text for
  * the classifier and one hashable "last user message" for the cache key.
  * Per-entry and total bounds keep oversized transcripts out of the prompt.
@@ -30,16 +30,16 @@ export interface SessionTexts {
 
 /** Extract the recent conversation and last user text from the agent's session. */
 export function sessionTexts(agent: Agent): SessionTexts {
-  const events = agent.session.events
+  const events = agent.session.snapshotEvents()
   const entries: string[] = []
   for (let i = events.length - 1; i >= 0 && entries.length < MAX_ENTRIES; i -= 1) {
     const event = events[i]
     if (event === undefined) continue
     if (event.type === 'user/message') {
-      const text = textOfMessageBlocks((event.data as { content?: ContentBlock[] }).content)
+      const text = textOfMessageBlocks((event.data as { content?: readonly ContentBlock[] }).content)
       if (text !== '') entries.push(`user: ${bound(text)}`)
     } else if (event.type === 'assistant/message') {
-      const message = (event.data as { message?: { content?: ContentBlock[] } }).message
+      const message = (event.data as { message?: { content?: readonly ContentBlock[] } }).message
       const text = textOfMessageBlocks(message?.content)
       if (text !== '') entries.push(`assistant: ${bound(text)}`)
     }
@@ -51,14 +51,14 @@ export function sessionTexts(agent: Agent): SessionTexts {
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event = events[i]
     if (event?.type === 'user/message') {
-      const text = textOfMessageBlocks((event.data as { content?: ContentBlock[] }).content)
+      const text = textOfMessageBlocks((event.data as { content?: readonly ContentBlock[] }).content)
       if (text !== '') { lastUserText = text; break }
     }
   }
   return { lastUserText, conversationText }
 }
 
-function textOfMessageBlocks(blocks: ContentBlock[] | undefined): string {
+function textOfMessageBlocks(blocks: readonly ContentBlock[] | undefined): string {
   if (!Array.isArray(blocks)) return ''
   return blocks
     .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')

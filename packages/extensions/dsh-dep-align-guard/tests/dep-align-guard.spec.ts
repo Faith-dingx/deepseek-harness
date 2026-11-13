@@ -18,7 +18,8 @@ import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import * as guard from '../src/index.ts'
@@ -76,6 +77,11 @@ async function setup(config: Record<string, unknown> = {}): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  // cordis 4.1 (0.2.2-rc.2) parks a plugin whose `inject` is unsatisfied in
+  // PENDING instead of activating it: without the projection registry the
+  // AgentRegistry never publishes `agents`, and the guard stays silently
+  // inactive.
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(guard, config)
   return ctx
@@ -90,8 +96,8 @@ async function preExecute(
 ): Promise<{ kind: string; reason?: string; nextCalls: number }> {
   const exec = {
     token: Symbol('exec'),
-    callId: CallId(`pre-${name}-${Math.random()}`),
-    rootCallId: CallId('dep-align-root'),
+    callId: ToolCallId(`pre-${name}-${Math.random()}`),
+    rootToolCallId: ToolCallId('dep-align-root'),
     name,
     arguments: args,
     agent: { id: agentId } as ToolExecution['agent'],
@@ -116,8 +122,8 @@ async function postExecute(
 ): Promise<{ kind: string; feedback?: unknown; additionalContexts?: unknown[]; nextCalls: number }> {
   const exec = {
     token: Symbol('exec'),
-    callId: CallId(`post-${name}-${Math.random()}`),
-    rootCallId: CallId('dep-align-root'),
+    callId: ToolCallId(`post-${name}-${Math.random()}`),
+    rootToolCallId: ToolCallId('dep-align-root'),
     name,
     arguments: args,
     agent: { id: agentId } as ToolExecution['agent'],
@@ -261,9 +267,9 @@ describe('isAlignmentCommand（纯函数）', () => {
 
 describe('agentKeyOf（纯函数）', () => {
   it('优先 agent.id，缺省回退调用号', () => {
-    const withAgent = { agent: { id: 'sess-1' }, callId: CallId('c'), rootCallId: CallId('r') } as unknown as ToolExecution
+    const withAgent = { agent: { id: 'sess-1' }, callId: ToolCallId('c'), rootToolCallId: ToolCallId('r') } as unknown as ToolExecution
     expect(guard.agentKeyOf(withAgent)).toBe('sess-1')
-    const withoutAgent = { agent: undefined, callId: CallId('c'), rootCallId: CallId('r') } as unknown as ToolExecution
+    const withoutAgent = { agent: undefined, callId: ToolCallId('c'), rootCallId: ToolCallId('r') } as unknown as ToolExecution
     expect(guard.agentKeyOf(withoutAgent)).toBe('no-agent:r')
   })
 })
@@ -466,8 +472,8 @@ describe('dsh-dep-align-guard（tools/post-execute 对齐检测）', () => {
     const ctx = await setup({ workspaceRoot, alertDir: join(suiteRoot, 'alerts-6d'), runLockfileCheck: false })
     const exec = {
       token: Symbol('exec'),
-      callId: CallId(`post-passthrough-${Math.random()}`),
-      rootCallId: CallId('dep-align-root'),
+      callId: ToolCallId(`post-passthrough-${Math.random()}`),
+      rootToolCallId: ToolCallId('dep-align-root'),
       name: 'bash',
       arguments: { command: 'pnpm deploy --legacy --prod' },
       agent: { id: 'agent-a' } as ToolExecution['agent'],
@@ -493,8 +499,8 @@ describe('dsh-dep-align-guard（tools/post-execute 对齐检测）', () => {
     const ctx = await setup({ workspaceRoot, alertDir: join(suiteRoot, 'alerts-6e'), runLockfileCheck: false })
     const exec = {
       token: Symbol('exec'),
-      callId: CallId(`post-merge-${Math.random()}`),
-      rootCallId: CallId('dep-align-root'),
+      callId: ToolCallId(`post-merge-${Math.random()}`),
+      rootToolCallId: ToolCallId('dep-align-root'),
       name: 'bash',
       arguments: { command: 'pnpm install' },
       agent: { id: 'agent-a' } as ToolExecution['agent'],

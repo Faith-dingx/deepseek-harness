@@ -4,8 +4,13 @@
     "rootDir": "src",
     "outDir": "lib/types"
   },
-  "include": ["src"],
+  "include": [
+    "src"
+  ],
   "references": [
+    {
+      "path": "../../util/error"
+    },
     {
       "path": "../../../vendor/cosmokit"
     },
@@ -31,9 +36,6 @@
       "path": "../fs-observation-policy"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
-    },
-    {
       "path": "../../sandbox/sandbox"
     },
     {
@@ -44,6 +46,18 @@
     },
     {
       "path": "../../attachment/attachment"
+    },
+    {
+      "path": "../../util/code-language"
+    },
+    {
+      "path": "../fs-patch"
+    },
+    {
+      "path": "../../util/values"
+    },
+    {
+      "path": "../../session/working-directory"
     }
   ]
 }

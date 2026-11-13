@@ -1,17 +1,16 @@
 /**
- * High-level run API over {@link HarnessClient}: `DeepSeekHarness` owns one
- * runtime subprocess across many sessions; `HarnessSession.run` sends a
- * prompt and settles when the whole agent next becomes idle.
- * Mirrors the Python SDK's `DeepSeekHarness`/`Session` pair.
+ * High-level run API over {@link HarnessClient}: route text to prompts or native
+ * commands and collect prompt activity for text and image input.
  *
  * @module @deepseek-ai/dsh-sdk-client/api
  */
 
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
-import { HarnessClient, isRecord, SdkProtocolError } from './client.ts'
-import type { ContentBlock, DeepSeekHarnessOptions, HarnessClientOptions, HarnessNotification, RunResult } from './types.ts'
+import type { SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session'
+import { createProcessHarnessClient, HarnessClient, isRecord, queryInput, SdkProtocolError } from './client.ts'
+import type { RuntimeProcessOptions } from './launch.ts'
+import type { ContentBlock, DeepSeekHarnessOptions, HarnessNotification, RunResult, SdkPromptContentBlock } from './types.ts'
 
 /**
  * Reusable SDK for running DeepSeek Harness agent turns in a runtime
@@ -21,31 +20,37 @@ import type { ContentBlock, DeepSeekHarnessOptions, HarnessClientOptions, Harnes
  */
 export class DeepSeekHarness implements AsyncDisposable {
   private clientInstance: HarnessClient
-  private readonly launch: HarnessClientOptions
+  private readonly createClient: () => HarnessClient
   private readonly cwd: string
   private readonly provider: string
   private readonly model: string
+  private readonly reasoningEffort: DeepSeekHarnessOptions['reasoningEffort']
   private readonly maxTokens: number | undefined
+  private readonly approvalRequests: boolean | undefined
   private initialized: Promise<void> | undefined
   private closed = false
 
-  /** @param options - runtime launch spec plus the session route (cwd/provider/model). */
-  constructor(options: DeepSeekHarnessOptions) {
-    this.launch = options.launch
-    this.clientInstance = new HarnessClient(options.launch)
+  /** @param options - dsh launch configuration plus the session route, effort, and output cap. */
+  constructor(options?: DeepSeekHarnessOptions)
+  constructor(options: DeepSeekHarnessOptions = {}, clientFactory?: () => HarnessClient) {
+    this.createClient = clientFactory ?? (() => new HarnessClient(options))
+    this.clientInstance = this.createClient()
     // Absolute before the handshake: the child spawns relative to THIS
     // process's cwd, but the wire cwd is resolved again inside the child — a
     // relative value would double-resolve (e.g. `worker` → `worker/worker`).
-    this.cwd = resolve(options.cwd ?? options.launch.cwd ?? process.cwd())
+    this.cwd = resolve(options.cwd ?? options.processCwd ?? process.cwd())
     this.provider = options.provider ?? 'deepseek-official'
     this.model = options.model ?? 'deepseek-v4-flash'
+    this.reasoningEffort = options.reasoningEffort
     this.maxTokens = options.maxTokens
+    this.approvalRequests = options.approvalRequests
   }
 
   /**
    * The underlying JSON-RPC client (exposed for low-level access). A failed
-   * handshake reaps its runtime and swaps in a fresh instance, so do not
-   * cache this across a failed {@link start}.
+   * handshake swaps in a fresh instance only after cleanup proves the runtime
+   * exited; cleanup failure retains this client, so do not cache it across a
+   * failed {@link start}.
    * @returns the client currently owning the runtime subprocess.
    */
   get client(): HarnessClient {
@@ -54,9 +59,12 @@ export class DeepSeekHarness implements AsyncDisposable {
 
   /**
    * Start the subprocess and perform the `initialize` handshake once. On
-   * failure the runtime is reaped and a fresh client replaces it
-   * (`HarnessClient.close` is permanent), so a later call retries with a new
-   * subprocess — unless {@link close} already ended this harness.
+   * failure, successful SDK-owned cleanup reaps the runtime and installs a
+   * fresh client (`HarnessClient.close` is permanent), so a later call retries
+   * with a new subprocess unless {@link close} already ended this harness. If
+   * cleanup also fails, rejects with an `AggregateError` whose ordered errors
+   * preserve both causes and retains the failed client rather than spawning
+   * alongside a process whose exit was not proved.
    * @returns settlement of the (memoized) handshake.
    */
   start(): Promise<void> {
@@ -67,12 +75,21 @@ export class DeepSeekHarness implements AsyncDisposable {
           cwd: this.cwd,
           provider: this.provider,
           model: this.model,
+          ...this.reasoningEffort === undefined ? {} : { reasoningEffort: this.reasoningEffort },
           ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
+          ...this.approvalRequests === undefined ? {} : { approvalRequests: this.approvalRequests },
         })
       } catch (error) {
         this.initialized = undefined
-        await this.clientInstance.close()
-        if (!this.closed) this.clientInstance = new HarnessClient(this.launch)
+        try {
+          await this.clientInstance.close()
+        } catch (cleanupError: unknown) {
+          throw new AggregateError(
+            [error, cleanupError],
+            'DeepSeek Harness initialization and cleanup failed',
+          )
+        }
+        if (!this.closed) this.clientInstance = this.createClient()
         throw error
       }
     })()
@@ -81,7 +98,7 @@ export class DeepSeekHarness implements AsyncDisposable {
 
   /**
    * Open a session handle (no wire traffic; the runtime creates the session
-   * on its first prompt).
+   * on its first prompt or working-directory operation).
    * @param sessionId - explicit id to reuse; omitted mints a fresh one.
    * @returns the session handle.
    */
@@ -90,12 +107,24 @@ export class DeepSeekHarness implements AsyncDisposable {
   }
 
   /**
-   * Run one prompt on a fresh (or named) session.
-   * @param input - prompt text, or content blocks sent verbatim.
-   * @param options - optional session id and per-notification observer.
-   * @returns the owned activity interval.
+   * Start the runtime and restore a persisted session without sending input.
+   * The configured Harness home must contain its history; missing or occupied sessions reject.
+   * @param sessionId - exact persisted identity to continue.
+   * @returns a handle ready to run new prompts on the restored history.
    */
-  run(input: string | ContentBlock[], options?: RunOptions): Promise<RunResult> {
+  async resumeSession(sessionId: string): Promise<HarnessSession> {
+    await this.start()
+    await this.client.resumeSession(sessionId)
+    return new HarnessSession(this, sessionId)
+  }
+
+  /**
+   * Run text or content blocks on a fresh or named Session through native input routing.
+   * @param input - prompt or command text, optionally accompanied by image content blocks.
+   * @param options - optional Session identity and notification observer.
+   * @returns the completed input's RunResult, including its Session id.
+   */
+  run(input: string | SdkPromptContentBlock[], options?: RunOptions): Promise<RunResult> {
     return this.session(options?.sessionId).run(input, options)
   }
 
@@ -118,12 +147,76 @@ export class DeepSeekHarness implements AsyncDisposable {
   }
 }
 
-/** Per-run options: target session and streaming observer. */
+/** Construct the high-level API against a generic process for package-local fake-runtime tests. */
+export function createProcessDeepSeekHarness(
+  runtime: RuntimeProcessOptions,
+  options: DeepSeekHarnessOptions = {},
+): DeepSeekHarness {
+  const Constructor = DeepSeekHarness as new (
+    publicOptions: DeepSeekHarnessOptions,
+    clientFactory: () => HarnessClient,
+  ) => DeepSeekHarness
+  return new Constructor({
+    ...runtime.cwd === undefined ? {} : { processCwd: runtime.cwd },
+    ...options,
+  }, () => createProcessHarnessClient(runtime))
+}
+
+/** Per-run Session identity and notification observer. */
 export interface RunOptions {
   /** Session id to run on; omitted mints a fresh session per call. */
   sessionId?: string
-  /** Observer invoked with every notification for this session tree, in wire order. */
+  /**
+   * Observe the input's Session-tree activity in wire order until completion.
+   * The interval can include overlapping work from other inputs.
+   */
   onNotification?: (notification: HarnessNotification) => void
+}
+
+/** Collect one input's root events and Session-tree notifications from its admission. */
+class RunActivity {
+  commandDone = false
+  private received = false
+  private readonly events: SessionEvent[] = []
+  private readonly notifications: HarnessNotification[] = []
+
+  constructor(private readonly sessionId: string, private readonly receipt: { messageId: string } | { commandId: string }) {}
+
+  /** Ignore pre-receipt traffic; validate root events before invoking the observer. */
+  record(notification: HarnessNotification, onNotification?: RunOptions['onNotification']): boolean {
+    if (notification.method === 'session.query.completed') return false
+    if (!this.received) {
+      if (notification.method !== 'session.event' || notification.params.sessionId !== this.sessionId
+        || !this.matchesReceipt(notification.params.event)) return false
+      this.received = true
+    }
+    const event = notification.method === 'session.event' && notification.params.sessionId === this.sessionId
+      ? validatedSessionEvent(notification.params.event) : undefined
+    if (event?.type === 'command/done' && 'commandId' in this.receipt
+      && isRecord(event.data) && event.data.commandId === this.receipt.commandId) this.commandDone = true
+    this.notifications.push(notification)
+    onNotification?.(notification)
+    if (event !== undefined) this.events.push(event)
+    return true
+  }
+
+  private matchesReceipt(event: unknown): boolean {
+    return 'messageId' in this.receipt ? isInboxReceipt(event, this.receipt.messageId)
+      : isRecord(event) && event.type === 'command/run' && isRecord(event.data)
+        && event.data.commandId === this.receipt.commandId
+  }
+
+  result(completed?: { finalResponse: string; finishReason: string }): RunResult {
+    if (completed !== undefined && !this.commandDone) {
+      throw new SdkProtocolError('Command completion is missing matching lifecycle events')
+    }
+    const terminal = this.events.findLast(event => event.type === 'turn/end')
+    return {
+      sessionId: this.sessionId, finalResponse: completed?.finalResponse ?? finalResponse(this.events),
+      finishReason: completed?.finishReason ?? terminal?.data.reason.kind ?? null,
+      events: this.events, notifications: this.notifications,
+    }
+  }
 }
 
 /**
@@ -137,74 +230,111 @@ export class HarnessSession {
   constructor(readonly harness: DeepSeekHarness, readonly id: string) {}
 
   /**
-   * Queue one prompt, then observe the whole session through its next idle.
-   * @param input - prompt text, or content blocks sent verbatim.
-   * @param options - optional per-notification observer.
-   * @returns the owned activity interval; rejects on transport loss, timeout,
-   * or a protocol error.
+   * Read the effective directory and recover a missing directory to the Session origin.
+   * @returns the absolute directory used by new independent operations.
    */
-  async run(input: string | ContentBlock[], options?: Pick<RunOptions, 'onNotification'>): Promise<RunResult> {
+  async getWorkingDirectory(): Promise<string> {
+    await this.harness.start()
+    return this.harness.client.getWorkingDirectory(this.id)
+  }
+
+  /**
+   * Change the effective directory without moving existing processes or changing permissions.
+   * @param path - absolute or Session-current-directory-relative directory.
+   * @returns the validated absolute directory.
+   */
+  async setWorkingDirectory(path: string): Promise<string> {
+    await this.harness.start()
+    return this.harness.client.setWorkingDirectory(this.id, path)
+  }
+
+  /**
+   * Run text or content blocks through native prompt-or-command routing.
+   * @param input - prompt or command text, optionally accompanied by image content blocks; image-only input is an ordinary prompt.
+   * @param options - a per-notification observer.
+   * @returns RunResult after prompt activity, a state-only command, or command-started model work ends.
+   * Goal creation and resume include automatic rounds through goal termination and the closing reply.
+   * Native handler refusals return finishReason="error".
+   * @throws on routing, protocol, transport or observer failure; runtime work is not rolled back.
+   */
+  async run(input: string | SdkPromptContentBlock[], options?: Pick<RunOptions, 'onNotification'>): Promise<RunResult> {
     await this.harness.start()
     const client = this.harness.client
-    const contentBlocks = normalizeInput(input)
-    const events: SessionEvent[] = []
-    const notifications: HarnessNotification[] = []
-
     const subscription = client.subscribeSessionTree(this.id)
-    const collect = (notification: HarnessNotification): void => {
-      if (notification.method === 'session.event' && notification.params.sessionId === this.id) {
-        // Wire boundary: the envelope feeds the typed RunResult, so a
-        // malformed runtime surfaces as a protocol error, not as type-invalid
-        // data (or a TypeError out of finalResponse).
-        const event = validatedSessionEvent(notification.params.event)
-        notifications.push(notification)
-        options?.onNotification?.(notification)
-        events.push(event)
-        return
-      }
-      notifications.push(notification)
-      options?.onNotification?.(notification)
-    }
     try {
-      const messageId = await client.prompt(this.id, contentBlocks)
-      let received = false
+      const response = await queryInput(client, this.id, input)
+      if (response.kind === 'command') {
+        const activity = new RunActivity(this.id, { commandId: response.execution.commandId })
+        while (true) {
+          const notification = await subscription.next()
+          const params = notification.params
+          if (notification.method === 'session.query.completed' && params.sessionId === this.id) {
+            if (typeof params.commandId !== 'string' || params.commandId.length === 0) {
+              throw new SdkProtocolError('Invalid session.query.completed command identity')
+            }
+            if (params.commandId !== response.execution.commandId) continue
+            if (typeof params.finalResponse !== 'string' || typeof params.finishReason !== 'string'
+              || params.finishReason.length === 0) throw new SdkProtocolError('Invalid session.query.completed result')
+            // Failure completion can precede handler settlement; its lifecycle is queued before the RPC response.
+            while (!activity.commandDone) {
+              const queued = subscription.tryNext()
+              if (queued === undefined) break
+              activity.record(queued, options?.onNotification)
+            }
+            return activity.result({ finalResponse: params.finalResponse, finishReason: params.finishReason })
+          }
+          activity.record(notification, options?.onNotification)
+        }
+      }
+      const activity = new RunActivity(this.id, { messageId: response.messageId })
       while (true) {
         const notification = await subscription.next()
-        if (!received) {
-          if (notification.method !== 'session.event'
-            || notification.params.sessionId !== this.id
-            || !isInboxReceipt(notification.params.event, messageId)) continue
-          received = true
-        }
-        collect(notification)
+        if (!activity.record(notification, options?.onNotification)) continue
         if (notification.method === 'session.status'
           && notification.params.sessionId === this.id
           && notification.params.status === 'idle') break
       }
+      return activity.result()
     } finally {
       subscription.close()
     }
+  }
 
-    return {
-      sessionId: this.id,
-      finalResponse: finalResponse(events),
-      events,
-      notifications,
+}
+
+/** Validate the provider-read fields of one wire turn-end reason. */
+function validatedTurnEndReason(value: unknown): TurnEndReason {
+  if (!isRecord(value) || typeof value.kind !== 'string') {
+    throw new SdkProtocolError(`turn/end carried no reason envelope: ${JSON.stringify(value)}`)
+  }
+  if (value.kind === 'aborted') {
+    if (!isRecord(value.reason) || typeof value.reason.kind !== 'string') {
+      throw new SdkProtocolError(`turn/end carried a malformed aborted reason: ${JSON.stringify(value)}`)
+    }
+    switch (value.reason.kind) {
+      case 'user':
+      case 'parent':
+      case 'disposed':
+      case 'legacy':
+        break
+      case 'hook':
+        if (typeof value.reason.reason !== 'string') {
+          throw new SdkProtocolError(`turn/end carried a malformed hook abort reason: ${JSON.stringify(value)}`)
+        }
+        break
+      default:
+        throw new SdkProtocolError(`turn/end carried an unknown abort reason: ${JSON.stringify(value)}`)
     }
   }
+  return value as TurnEndReason
 }
 
 /**
- * Normalize run input: a string becomes one text block; blocks pass verbatim.
- * @param input - prompt text or content blocks.
- * @returns the content blocks to send.
+ * Validate the event envelope and assistant/turn fields consumed by SDK readers.
+ * @param value - the raw `session.event` event payload.
+ * @returns the event, or throws a protocol error for malformed consumed fields.
  */
-export function normalizeInput(input: string | ContentBlock[]): ContentBlock[] {
-  return typeof input === 'string' ? [{ type: 'text', text: input }] : input
-}
-
-/** Validate the fields in a wire `session.event` envelope before returning the typed result. */
-function validatedSessionEvent(value: unknown): SessionEvent {
+export function validatedSessionEvent(value: unknown): SessionEvent {
   if (!isRecord(value) || typeof value.type !== 'string') {
     throw new SdkProtocolError(`session.event carried no event envelope: ${JSON.stringify(value)}`)
   }
@@ -218,7 +348,14 @@ function validatedSessionEvent(value: unknown): SessionEvent {
       throw new SdkProtocolError(`assistant/message event carried malformed content: ${JSON.stringify(value)}`)
     }
   }
-  return value as unknown as SessionEvent
+  if (value.type === 'turn/end') {
+    const data = isRecord(value.data) ? value.data : undefined
+    if (data === undefined) {
+      throw new SdkProtocolError(`turn/end event carried malformed data: ${JSON.stringify(value)}`)
+    }
+    validatedTurnEndReason(data.reason)
+  }
+  return value as SessionEvent
 }
 
 /** Whether a raw session event is the durable enqueue receipt for `messageId`. */

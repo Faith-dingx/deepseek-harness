@@ -8,27 +8,34 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 import { ShellEnvRegistry } from '@deepseek-ai/dsh-shell-env'
 import * as BashEnvPlugin from '@deepseek-ai/dsh-shell-env'
 
 const testToolSignal = new AbortController().signal
 
-afterEach(() => vi.unstubAllEnvs())
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks() })
 
 function execution(sessionId?: string): ToolExecution {
   return {
     signal: testToolSignal,
     token: Symbol('bash-env-test') as ToolExecution['token'],
-    callId: CallId('bash-env-call'),
-    rootCallId: CallId('bash-env-call'),
+    callId: ToolCallId('bash-env-call'),
+    rootCallId: ToolCallId('bash-env-call'),
     name: 'bash',
     arguments: { command: 'true' },
     ...(sessionId === undefined
       ? {}
-      : { agent: { session: { header: { version: 0, id: sessionId, createdAt: 0 } } } as Agent }),
+      : {
+        agent: {
+          session: {
+            header: { version: SESSION_FORMAT_VERSION, id: sessionId, createdAt: 0, isSeeded: false },
+          },
+        } as unknown as Agent,
+      }),
   }
 }
 
@@ -39,13 +46,44 @@ describe('ShellEnvRegistry', () => {
 
     expect(registry.collect(execution())).toEqual({
       DSH_HOME: resolve('./test-dsh-home'),
+      DSH_NODE_EXECUTABLE: process.execPath,
       DSH_SHELL: '1',
     })
     expect(registry.collect(execution('session-a'))).toEqual({
       DSH_HOME: resolve('./test-dsh-home'),
+      DSH_NODE_EXECUTABLE: process.execPath,
       DSH_SESSION_ID: 'session-a',
       DSH_SHELL: '1',
     })
+  })
+
+  it('omits the Node executable inside a single-executable application', () => {
+    vi.spyOn(process, 'getBuiltinModule').mockReturnValue({ isSea: () => true })
+    expect(new ShellEnvRegistry(new Context()).collect(execution())).not.toHaveProperty('DSH_NODE_EXECUTABLE')
+  })
+
+  it('keeps the Node executable where the runtime answers no single-executable module', () => {
+    vi.spyOn(process, 'getBuiltinModule').mockReturnValue(undefined)
+    expect(new ShellEnvRegistry(new Context()).collect(execution()).DSH_NODE_EXECUTABLE).toBe(process.execPath)
+  })
+
+  it('collects the launcher-provided profile name, directory, and installation directory when a profile context exists', () => {
+    const ctx = new Context()
+    ctx.provide('profileContext', {
+      name: 'web', dir: '/profiles/web', patchPath: '/profiles/web/cordis.patch.yml', installAnchor: '/dsh/package.json',
+      cwd: '/work', home: '/home', startedBundles: [], overlays: [], telemetryDisabledEnv: undefined,
+    })
+    const registry = new ShellEnvRegistry(ctx, { dshHome: './test-dsh-home' })
+    expect(registry.collect(execution())).toMatchObject({
+      DSH_INSTALL_DIR: '/dsh', DSH_PROFILE: 'web', DSH_PROFILE_DIR: '/profiles/web',
+    })
+    for (const key of ['DSH_PROFILE', 'DSH_INSTALL_DIR', 'DSH_NODE_EXECUTABLE']) {
+      expect(() => registry.register({
+        name: `${key}-claimer`,
+        variables: { [key]: { description: 'Reserved key.' } },
+        resolve: () => ({}),
+      })).toThrow(new RegExp(`reserved key "${key}"`))
+    }
   })
 
   it('resolves DSH_HOME from the ambient override or the user-home default', () => {
@@ -154,6 +192,7 @@ describe('ShellEnvRegistry', () => {
     })
 
     expect(() => registry.collect(execution())).toThrow(/drifted-provider.*DSH_UNDECLARED/)
+    expect(() => registry.collect(execution())).toThrow(expect.objectContaining({ name: 'ShellEnvError', code: 'SHELL_ENV_CONTRIBUTION_INVALID' }))
   })
 
   it('rejects non-string values returned by a contributor', () => {
@@ -165,6 +204,7 @@ describe('ShellEnvRegistry', () => {
     })
 
     expect(() => registry.collect(execution())).toThrow(/wrong-value-type.*non-string.*DSH_STRING/)
+    expect(() => registry.collect(execution())).toThrow(expect.objectContaining({ name: 'ShellEnvError', code: 'SHELL_ENV_CONTRIBUTION_INVALID' }))
   })
 
   it('removes an effect-scoped contributor when its plugin is disposed', async () => {
@@ -199,40 +239,10 @@ describe('ShellEnvRegistry', () => {
     expect(registry.collect(execution())).not.toHaveProperty('DSH_EXPLICIT_DISPOSAL')
   })
 
-  it('the plugin registers the service and the persistence contributor on load', async () => {
+  it('the plugin registers the service with no contributors on load', async () => {
     const ctx = new Context()
     await ctx.plugin(BashEnvPlugin)
     expect(ctx.shellEnv).toBeInstanceOf(ShellEnvRegistry)
-    expect(ctx.shellEnv.list()).toEqual([
-      {
-        contributor: 'session-persistence',
-        description: 'Absolute target path of the current session JSONL when the active persistence backend provides one.',
-        key: 'DSH_SESSION_JSONL',
-      },
-    ])
-  })
-
-  it('the persistence contributor resolves DSH_SESSION_JSONL only for a jsonl backend', async () => {
-    const ctx = new Context()
-    await ctx.plugin(BashEnvPlugin)
-    ctx.provide('sessionPersistence', {
-      locate: () => ({ kind: 'jsonl' as const, path: 'C:\\sessions\\s.jsonl' }),
-    })
-    expect(ctx.shellEnv.collect(execution('sess-p')).DSH_SESSION_JSONL).toBe('C:\\sessions\\s.jsonl')
-  })
-
-  it('the persistence contributor omits the variable for a non-jsonl backend', async () => {
-    const ctx = new Context()
-    await ctx.plugin(BashEnvPlugin)
-    ctx.provide('sessionPersistence', {
-      locate: () => ({ kind: 'sqlite' as const, path: 'C:\\sessions\\s.db' }),
-    })
-    expect(ctx.shellEnv.collect(execution('sess-p'))).not.toHaveProperty('DSH_SESSION_JSONL')
-  })
-
-  it('the persistence contributor omits the variable without a persistence backend', async () => {
-    const ctx = new Context()
-    await ctx.plugin(BashEnvPlugin)
-    expect(ctx.shellEnv.collect(execution('sess-p'))).not.toHaveProperty('DSH_SESSION_JSONL')
+    expect(ctx.shellEnv.list()).toEqual([])
   })
 })

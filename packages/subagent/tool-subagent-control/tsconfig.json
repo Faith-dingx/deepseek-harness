@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../../vendor/schemastery"
+    },
+    {
       "path": "../../../vendor/cosmokit"
     },
     {
@@ -27,7 +30,10 @@
       "path": "../subagent"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../core/agent"
+    },
+    {
+      "path": "../../core/system-prompt"
     }
   ]
 }

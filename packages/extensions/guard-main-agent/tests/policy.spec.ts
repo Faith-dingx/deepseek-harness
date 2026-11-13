@@ -11,14 +11,16 @@ import {
   isRmCommand,
   parseClassifierOutput,
   resolveVerdict,
+  rmTargetsOutside,
 } from '../src/policy.ts'
 import type { FallbackMode, ResolvedGuardConfig } from '../src/types.ts'
 
-const config = (options: { fallback?: FallbackMode; diagnosticFallback?: FallbackMode } = {}): ResolvedGuardConfig => ({
+const config = (options: { fallback?: FallbackMode; diagnosticFallback?: FallbackMode; codeClassFallback?: FallbackMode } = {}): ResolvedGuardConfig => ({
   classifierEndpoint: 'http://classifier:9888/v1/chat/completions',
   classifierModel: 'agnes/agnes-2.5-flash',
   fallback: options.fallback ?? 'close',
   diagnosticFallback: options.diagnosticFallback ?? 'open',
+  codeClassFallback: options.codeClassFallback ?? 'close',
   timeoutMs: 5000,
   retryCount: 1,
   cacheTtlMs: 600000,
@@ -441,5 +443,52 @@ describe('resolveVerdict — readonly shell fail-open (classifier down)', () => 
     const verdict = resolveVerdict({ toolName: 'bash', output: null, config: config() })
     expect(verdict.verdict).toBe('block')
     expect(verdict.delegateTo).toBe('code-agent')
+  })
+})
+
+describe('codeClassFallback (2026-10-30 用户授权)', () => {
+  it('fails open for code-class tools when configured open', () => {
+    const verdict = resolveVerdict({
+      toolName: 'bash',
+      output: null,
+      config: config({ codeClassFallback: 'open' }),
+    })
+    expect(verdict.verdict).toBe('allow')
+    expect(verdict.delegateTo).toBeNull()
+    expect(verdict.classifierFailed).toBe(true)
+  })
+
+  it('keeps the historical delegation when left at the default close', () => {
+    const verdict = resolveVerdict({ toolName: 'bash', output: null, config: config() })
+    expect(verdict.verdict).toBe('block')
+    expect(verdict.delegateTo).toBe('code-agent')
+  })
+})
+
+describe('rmTargetsOutside (工作区内 rm 放行)', () => {
+  const cwd = '/home/user/ws'
+  const home = '/home/user'
+
+  it('allows deletions confined to the workspace', () => {
+    expect(rmTargetsOutside('rm -rf build/cache', cwd, home)).toEqual([])
+    expect(rmTargetsOutside('rm -rf ./build/ ./dist/', cwd, home)).toEqual([])
+  })
+
+  it('blocks targets outside the workspace', () => {
+    expect(rmTargetsOutside('rm -rf /etc/nginx', cwd, home)).toEqual(['/etc/nginx'])
+    expect(rmTargetsOutside('rm -rf ../other-project', cwd, home)).toEqual(['../other-project'])
+    expect(rmTargetsOutside('rm -rf ~/.ssh', cwd, home)).toEqual(['~/.ssh'])
+  })
+
+  it('blocks dangerous roots, missing targets and subcommand forms', () => {
+    expect(rmTargetsOutside('rm -rf /', cwd, home)).toEqual(['/'])
+    expect(rmTargetsOutside('rm -rf', cwd, home)).toEqual(['(无目标)'])
+    expect(rmTargetsOutside('git rm -r docs', cwd, home).length).toBeGreaterThan(0)
+    expect(rmTargetsOutside('docker rm -f web', cwd, home).length).toBeGreaterThan(0)
+  })
+
+  it('detects rm inside compound commands', () => {
+    expect(rmTargetsOutside('cd /tmp && rm -rf x', cwd, home)).toEqual(['x'])
+    expect(rmTargetsOutside('ls -la && rm -rf ./tmp/a', cwd, home)).toEqual([])
   })
 })

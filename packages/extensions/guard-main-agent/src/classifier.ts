@@ -104,8 +104,10 @@ export async function callClassifier(
           { role: 'system', content: system },
           { role: 'user', content: user },
         ],
-        temperature: 0,
-        max_tokens: 200,
+        // Minimal payload by design (user directive 2026-09-10): no temperature /
+        // max_tokens — reasoning-grade router targets may reject temperature 0 or
+        // deny requests carrying sampling params, and every rejected classify
+        // call is a fail-close outage for all guarded tool calls.
       }),
       signal: controller.signal,
     })

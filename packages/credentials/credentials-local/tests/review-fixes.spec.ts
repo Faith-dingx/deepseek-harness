@@ -1,7 +1,3 @@
-// Third-review behaviors: read-modify-write under the writer lock (external
-// edits survive an API write), the contained credentials/reference-updated fan-out (a
-// broken observer never fails a committed write), and the YAML document
-// editor's isolation between entries.
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
@@ -10,7 +6,6 @@ import { join } from 'node:path'
 import { credentialKey, credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LocalCredentialProvider } from '../src/index.ts'
 
-/** Credential documents are seeded owner-only, exactly as the provider creates them. */
 function writeCredentials(file: string, text: string): Promise<void> {
   return writeFile(file, text, { mode: 0o600 })
 }
@@ -138,21 +133,6 @@ describe('contained update fan-out', () => {
     await new Promise(resolve => setTimeout(resolve, 10))
   })
 
-  it('rethrows an invariant-coded failure after the commit and the remaining listeners', async () => {
-    const dir = await tempDir()
-    const path = join(dir, '.credentials.yaml')
-    const ctx = await boot({ path, watch: false })
-    ctx.on('credentials/reference-updated', () => {
-      throw Object.assign(new Error('forged relation'), { code: 'INVARIANT' })
-    })
-    const second = vi.fn()
-    ctx.on('credentials/reference-updated', second)
-    await expect(ctx.credentials.set(ALPHA, 'one')).rejects.toThrow(/forged relation/)
-    // Harness-fatal by design — but the write itself committed first.
-    expect(second).toHaveBeenCalledWith(ALPHA)
-    expect(await readFile(path, 'utf8')).toContain(`${ALPHA}: one`)
-    expect(await ctx.credentials.resolve(ALPHA)).toEqual({ value: 'one', source: 'file' })
-  })
 })
 
 describe('document editor', () => {

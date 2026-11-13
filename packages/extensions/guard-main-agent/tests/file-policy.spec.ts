@@ -266,3 +266,54 @@ describe('loadPolicy — file reads and fail-close behavior', () => {
     expect((await policy.canWrite('/ws/docs/a.md')).allowed).toBe(false)
   })
 })
+
+const V3_YAML = `
+defaultPolicy: allow
+symlinkResolve: true
+blacklist:
+  - type: prefix
+    value: "/home/user/secret-dir/"
+    reason: "凭据目录"
+  - type: exact
+    value: "/ws/docs/protected.md"
+    reason: "受保护文档"
+whitelist:
+  - type: prefix
+    value: "/ws/docs/"
+    allowedExtensions: [".md"]
+    reason: "项目文档（仅markdown）"
+`
+
+describe('v3.0 策略：defaultPolicy allow + blacklist（2026-10-30 用户授权）', () => {
+  const policy = () => createFilePolicy(parsePolicy(V3_YAML), { cwd: '/ws', fs: identityFs() })
+
+  it('非白名单、非黑名单路径默认放行', async () => {
+    const decision = await policy().canWrite('/ws/.temp/notes.txt')
+    expect(decision.allowed).toBe(true)
+    expect(decision.reason).toContain('defaultPolicy: allow')
+  })
+
+  it('黑名单命中优先拒绝（凭据目录）', async () => {
+    const decision = await policy().canWrite('/home/user/secret-dir/token.txt')
+    expect(decision.allowed).toBe(false)
+    expect(decision.reason).toContain('黑名单')
+  })
+
+  it('黑名单命中优先拒绝（受保护文档，即使白名单目录内）', async () => {
+    const decision = await policy().canWrite('/ws/docs/protected.md')
+    expect(decision.allowed).toBe(false)
+    expect(decision.reason).toContain('黑名单')
+  })
+
+  it('白名单路径仍然放行', async () => {
+    const decision = await policy().canWrite('/ws/docs/guide.md')
+    expect(decision.allowed).toBe(true)
+    expect(decision.reason).toContain('白名单')
+  })
+
+  it('defaultPolicy: deny 保持原 fail-close 行为', async () => {
+    const deny = createFilePolicy(parsePolicy(V3_YAML.replace('defaultPolicy: allow', 'defaultPolicy: deny')), { cwd: '/ws', fs: identityFs() })
+    const decision = await deny.canWrite('/ws/.temp/notes.txt')
+    expect(decision.allowed).toBe(false)
+  })
+})

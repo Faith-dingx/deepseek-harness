@@ -67,6 +67,18 @@ export interface GuardPluginConfig {
   fallback?: FallbackMode
   /** Fallback policy for diagnostic/read-only tools (default `open`). */
   diagnosticFallback?: FallbackMode
+  /**
+   * Fallback policy for code-class tools (bash/shell/edit families) when the
+   * classifier is unavailable (default `close`).
+   *
+   * `close` keeps the historical hard rule (code work is delegated to
+   * code-agent when the classifier is down). `open` is the 2026-10-30 user
+   * authorization: the main agent keeps basic work moving while the
+   * classifier is unreachable, at the cost of losing the boundary opinion.
+   * The rm hard rule, the file policy and the delegation tools are NOT
+   * affected by this switch.
+   */
+  codeClassFallback?: FallbackMode
   /** Classifier request timeout, milliseconds. */
   timeoutMs?: number
   /**
@@ -92,6 +104,8 @@ export interface ResolvedGuardConfig {
   readonly classifierModel: string
   readonly fallback: FallbackMode
   readonly diagnosticFallback: FallbackMode
+  /** Fallback policy for code-class tools (resolved default `close`). */
+  readonly codeClassFallback: FallbackMode
   readonly timeoutMs: number
   /** Retry count for transient classifier timeouts (resolved default `1`). */
   readonly retryCount: number

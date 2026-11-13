@@ -1,5 +1,8 @@
 CLAUDE.local.md
 .env
+apps/desktop/.env.windows
+apps/desktop/.env.macos
+apps/desktop/*.p12
 node_modules/
 lib/
 *.tsbuildinfo
@@ -11,6 +14,7 @@ examples/*/*.jsonl
 .sessions/
 examples/*/.sessions/
 coverage/
+.coverage-times.json
 .doc-typecheck-*/
 .node-next-types-*/
 .oxlint-contract-*/
@@ -26,21 +30,42 @@ tmp/
 .idea
 mise.toml
 dist-exe/
-python/sdk-runtime/src/deepseek_harness_runtime/runtime/dsh-jsonrpc-agent-*
-python/sdk-runtime/src/deepseek_harness_runtime/runtime/node/
+/dist/
+apps/desktop/.desktop-build/
+python/sdk-runtime/src/deepseek_harness_runtime/runtime/
 python/**/__pycache__/
 python/**/.pytest_cache/
+packages/**/__pycache__/
 apps/web/dist/
+apps/cli/docs/
 .artifacts/
 .dsh-build/
+.dsh-report/
+.ui-review/
 .playwright-mcp/
 .orig
 .worktrees/
 worktrees/
 .agents/worktrees/
 .typert-*/
+native/system/test/bin/
+
+# Generated company-signed CUA release record.
+/packages/experimental/cua-macos/cua-helper.json
 
 # Runtime data directories
 .dsh/
 .dsh-memory/
 .temp/
+
+# 本地运行时目录（lan-access 定制，2026-08-19 用户约定）
+python/sdk-runtime/src/deepseek_harness_runtime/runtime/deepseek-harness-sdk-runtime-*
+python/sdk-runtime/src/deepseek_harness_runtime/runtime/node/
+
+# TypeScript compiler artifacts that a failed composite build can emit next to
+# their sources (tsc's error-recovery emit path). Upstream builds stay clean,
+# so these never belong in the tree.
+packages/*/*/src/**/*.js
+packages/*/*/src/**/*.js.map
+packages/*/*/src/**/*.d.ts
+packages/*/*/src/**/*.d.ts.map

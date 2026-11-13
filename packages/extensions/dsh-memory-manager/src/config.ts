@@ -203,8 +203,11 @@ export type MemoryFileKindLike = 'memory' | 'log' | 'reflection' | 'summary' | '
  * {@link resolveConfig}.
  */
 export interface PluginConfig {
+  /** Chat-completions endpoint for this plugin's LLM calls (summary + classification). */
   summaryEndpoint?: string
+  /** Model id used to generate conversation summaries (per-turn compression). */
   summaryModel?: string
+  /** Model id used by the audit pipeline's memory-kind classification. */
   classifyModel?: string
   /** History compression fires when turns >= threshold (§4.2.4). */
   triggerThresholdTurns?: number

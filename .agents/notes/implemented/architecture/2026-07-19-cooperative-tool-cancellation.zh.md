@@ -16,7 +16,7 @@ Status: implemented
 
 `ToolExecutionInput.signal` 是必填且只读的 `AbortSignal`，因此 `ToolExecution.signal` 和 `ToolRunContext.signal` 也都是必填且只读。每个类型化调用方显式提供自己持有的信号；注册表不提供重载、默认控制器、永不中止哨兵或便捷执行路径。
 
-`ToolDefinition.execute(args, exec)` 保持现有签名。`defineTool()` 会把 `exec.signal` 上下文推断为必填的 `AbortSignal`，因此每个已注册的 TypeScript 工具都能在无需类型断言的情况下观察或转发取消。所有第一方直接调用方和 Code Mode 嵌套调度都会显式传入当前操作的信号。
+`ToolDefinition.execute(args, exec)` 保持现有签名。`defineTool()` 会把 `exec.signal` 上下文推断为必填的 `AbortSignal`，因此每个已注册的 TypeScript 工具都能在无需类型断言的情况下观察或转发取消。所有第一方直接调用方和 PTC mode 嵌套调度都会显式传入当前操作的信号。
 
 注册表信任这份类型化同进程约定。它不在运行时校验 `AbortSignal`，也不为缺失或畸形信号添加敌意输入测试。校验仍位于解析器与配置、模型与工具 JSON、持久化与文件、worker、进程和协议边界；违反 TypeScript 接口的无类型 JavaScript 不享有兼容性约定。
 
@@ -32,7 +32,7 @@ Status: implemented
 
 `ABORTED_BEFORE_DISPATCH` 携带 `{ name: 'AbortError' }` 和模型可见文本 `Error: tool call aborted before dispatch`。凡取消阻止工具主体调用时都使用该结果，包括进入时已中止、前置策略或审批期间取消、包装层信号已中止、包装层在委托前返回的成功结果被调用方取消抢先，以及轮次取消后 agent loop（智能体循环）跳过的同批调用。
 
-`ABORTED` 携带模型可见文本 `Error: tool call aborted`，并且只在工具主体已经调用后使用，包括工具主体完成后环绕包装层或后置策略监听器等待期间发生的取消。拒绝、包装层失败、工具失败或后置策略失败比通用取消更具体。timeout-policy 自身拥有的超时仍为 `TOOL_TIMEOUT`，成功结果被取消替换前延后附加的上下文仍会保留。
+`ABORTED` 携带模型可见文本 `Error: tool call aborted`，并且只在工具主体已经调用后使用，包括工具主体完成后环绕包装层或后置策略监听器等待期间发生的取消。已开始的工具主体抛出 signal 的 reason，或不具备 `HarnessError` 身份、name 为 `AbortError` 的 `Error` 时，结果保留该 message，并携带 `{ name: 'AbortError', code: 'ABORTED' }`。拒绝、包装层失败、其他工具失败或后置策略失败比通用取消更具体。timeout-policy 自身拥有的超时仍为 `TOOL_TIMEOUT`，成功结果被取消替换前延后附加的上下文仍会保留。
 
 ### 进入时已中止会在物化后短路
 
@@ -46,7 +46,7 @@ Status: implemented
 
 ## 验证
 
-[`execution-signal-types.spec.ts`](../../../../packages/core/tools/tests/execution-signal-types.spec.ts) 证明必填的精确信号类型、观察者与工具的只读视图、环绕调度可替换但不可删除的视图，以及 `defineTool()` 推断。[`tools.spec.ts`](../../../../packages/core/tools/tests/tools.spec.ts) 覆盖进入时已中止的物化与阶段跳过、策略和包装层竞态、工具主体调用分类、调用方信号融合、错误优先级、上下文保留和完全停稳。[`tool-calls.spec.ts`](../../../../packages/core/agent-loop/tests/tool-calls.spec.ts) 与 [`contract-regressions.spec.ts`](../../../../packages/core/agent-loop/tests/contract-regressions.spec.ts) 覆盖为未调度的同批调用补齐持久化结果。[`code-mode.spec.ts`](../../../../packages/core/tools/tests/code-mode.spec.ts) 和第一方集成测试覆盖显式转发，[`timeout-policy.spec.ts`](../../../../packages/guard/timeout-policy/tests/timeout-policy.spec.ts) 保持超时归属。
+[`execution-signal-types.spec.ts`](../../../../packages/core/tools/tests/execution-signal-types.spec.ts) 证明必填的精确信号类型、观察者与工具的只读视图、环绕调度可替换但不可删除的视图，以及 `defineTool()` 推断。[`tools.spec.ts`](../../../../packages/core/tools/tests/tools.spec.ts) 覆盖进入时已中止的物化与阶段跳过、策略和包装层竞态、工具主体调用分类、调用方信号融合、错误优先级、上下文保留和完全停稳。[`tool-calls.spec.ts`](../../../../packages/core/agent-loop/tests/tool-calls.spec.ts) 与 [`contract-regressions.spec.ts`](../../../../packages/core/agent-loop/tests/contract-regressions.spec.ts) 覆盖为未调度的同批调用补齐持久化结果。[`ptc.spec.ts`](../../../../packages/core/tool-executor-ptc/tests/ptc.spec.ts) 和第一方集成测试覆盖显式转发，[`timeout-policy.spec.ts`](../../../../packages/guard/timeout-policy/tests/timeout-policy.spec.ts) 保持超时归属。
 
 任何注册表测试都无法证明任意第三方同进程代码会观察信号或在有界时间内停止。各能力的测试仍需在拥有相应副作用的边界证明取消与完全停稳。
 
@@ -62,7 +62,7 @@ Status: implemented
 
 **禁止环绕包装层替换信号。** 不予采纳，因为截止时间和嵌套操作作用域需要词法派生信号。捕获并融合调用方信号既保留组合能力，也不允许切断调用方取消。
 
-**让工具 promise 与取消竞速。** 不予采纳，因为这种方式会在副作用仍可能存活时报告完成，违反[dispose（资源释放）必须完全停稳的规则](../../../../docs/defensive-patterns.zh.md#dispose-must-reach-quiescence-not-just-request-it)。
+**让工具 promise 与取消竞速。** 不予采纳，因为这种方式会在副作用仍可能存活时报告完成，违反[dispose（资源释放）必须完全停稳的规则](../../../../docs/defensive-patterns/general.zh.md#dispose-must-reach-quiescence-not-just-request-it)。
 
 ## 后果
 

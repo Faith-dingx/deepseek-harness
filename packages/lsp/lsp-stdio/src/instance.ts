@@ -18,8 +18,9 @@ import { abortable, abortError } from './abort.ts'
 import { LspConnection } from './connection.ts'
 import type { ConnectionSpawner, ConnectionSpec, ConnectionWriter } from './connection.ts'
 import type { HostSource } from './host.ts'
-import type { WireInitializeResult, WireServerCapabilities } from './protocol.ts'
+import type { WireServerCapabilities } from './protocol.ts'
 import {
+  initializeCapabilities,
   negotiatePositionEncoding,
   normalizeHover,
   normalizeLocations,
@@ -44,7 +45,6 @@ export interface InstanceSpec extends ConnectionSpec {
  */
 export class LspInstance {
   private readonly connection: LspConnection
-  private capabilities: WireServerCapabilities | undefined
   /** The serialization tail: each query awaits the prior one, so lifecycles never interleave. */
   private queue: Promise<unknown> = Promise.resolve()
   private disposed = false
@@ -52,8 +52,8 @@ export class LspInstance {
   private teardownPromise: Promise<void> | undefined
   /** Set once the process closes, so the pool can synchronously skip a dead instance. */
   private processClosed = false
-  /** Populated once `initialize` succeeds; a failed handshake rejects every query. */
-  private readonly ready: Promise<void>
+  /** The server's negotiated capabilities once `initialize` succeeds; a failed handshake rejects every query. */
+  private readonly ready: Promise<WireServerCapabilities>
 
   /**
    * @param spec - the launch, initialize, and teardown parameters.
@@ -97,8 +97,9 @@ export class LspInstance {
     const run = abortable(this.queue, signal)
       .then(() => this.runQuery(request, source, signal))
       .catch(async (error: unknown) => {
-        if (this.isTransportFailure(error)) await this.startTeardown()
-        throw error
+        if (!this.isTransportFailure(error)) throw error
+        await this.awaitTeardownAttempt()
+        throw this.connection.settledFailure(error)
       })
     // Keep the tail alive regardless of this query's outcome so the next caller still serializes. The
     // tail follows the ACTUAL prior work (this.queue), not the abortable view, so a caller giving up
@@ -107,7 +108,7 @@ export class LspInstance {
     return run
   }
 
-  private async initialize(): Promise<void> {
+  private async initialize(): Promise<WireServerCapabilities> {
     const initializeResult = await this.connection.request('initialize', {
       // A subprocess provider may run in another PID namespace or machine;
       // the host PID would let the server monitor an unrelated process.
@@ -116,12 +117,12 @@ export class LspInstance {
       workspaceFolders: [{ uri: this.spec.workspaceUri, name: 'workspace' }],
       capabilities: CLIENT_CAPABILITIES,
       initializationOptions: this.spec.initializationOptions,
-    }) as WireInitializeResult
-    const capabilities = initializeResult.capabilities
+    })
+    const capabilities = initializeCapabilities(initializeResult)
     // An omitted encoding defaults to utf-16; any other value is a protocol error we reject here.
     negotiatePositionEncoding(capabilities.positionEncoding)
-    this.capabilities = capabilities
     await this.connection.notify('initialized', {})
+    return capabilities
   }
 
   private async runQuery(request: LspProviderQuery, source: HostSource, signal?: AbortSignal): Promise<LspQueryResult> {
@@ -132,17 +133,15 @@ export class LspInstance {
     // in failure — an abort on a still-pending handshake, OR `initialize` rejecting (utf-8
     // negotiation, malformed result) without the process exiting — tear the instance down so a
     // permanently-rejecting/pending `ready` can't make every later query for this workspace fail.
+    let capabilities: WireServerCapabilities
     try {
-      await abortable(this.ready, signal)
+      capabilities = await abortable(this.ready, signal)
     } catch (error) {
       if (!this.dead) {
-        await this.startTeardown()
+        await this.awaitTeardownAttempt()
       }
       throw error
     }
-    const capabilities = this.capabilities
-    /* v8 ignore next -- `ready` resolves only after capabilities are set, else it rejects above; defensive. */
-    if (capabilities === undefined) throw new Error('LSP instance is not initialized')
     if (!supportsOperation(capabilities, request.operation)) {
       throw new LspError(`server does not support ${request.operation}`, 'LSP_UNSUPPORTED_OPERATION')
     }
@@ -162,7 +161,7 @@ export class LspInstance {
       } catch (error) {
         // A canceled backpressured write or failed stdin leaves the protocol stream unusable before
         // `opened` can arm the didClose cleanup. Teardown here makes the pool evict the instance.
-        await this.startTeardown()
+        await this.awaitTeardownAttempt()
         throw error
       }
       opened = true
@@ -175,15 +174,10 @@ export class LspInstance {
       if (opened && !this.dead) {
         try {
           await this.connection.notify('textDocument/didClose', { textDocument: { uri } })
-        } catch {
+        } catch (_closeFailure: unknown) {
           // A close-write failure does not replace the settled result/error, but the instance can no
-          // longer be trusted: invalidate it and await bounded process termination.
-          try {
-            await this.startTeardown()
-          } catch {
-            /* v8 ignore next -- teardown owns all expected process races; this only preserves the
-               already-settled query outcome if an unexpected cleanup primitive itself rejects. */
-          }
+          // longer be trusted. The provider re-awaits this teardown and owns failure reporting.
+          await this.awaitTeardownAttempt()
         }
       }
     }
@@ -232,7 +226,7 @@ export class LspInstance {
             grace.signal.addEventListener('abort', () => { resolve(false) }, { once: true })
           }),
         ])
-        if (!settled) await this.startTeardown()
+        if (!settled) await this.awaitTeardownAttempt()
       } finally {
         grace[Symbol.dispose]()
       }
@@ -283,12 +277,21 @@ export class LspInstance {
     return this.teardownPromise
   }
 
+  /** Await teardown while leaving its memoized failure for provider-level finalization. */
+  private async awaitTeardownAttempt(): Promise<void> {
+    try {
+      await this.startTeardown()
+    } catch (_teardownFailure: unknown) {
+      // LocalLspProvider re-awaits the same teardown and combines it with the query outcome.
+    }
+  }
+
   private async tearDown(): Promise<void> {
     const shutdownDeadline = deadline(undefined, this.spec.shutdownTimeoutMs, 'LSP_SHUTDOWN')
     try {
       await this.gracefulShutdown(shutdownDeadline.signal)
     } catch {
-      // Graceful shutdown failed or timed out; process-tree cleanup below remains authoritative.
+      // Graceful shutdown failed or timed out; managed-range cleanup below remains authoritative.
     } finally {
       shutdownDeadline[Symbol.dispose]()
     }
@@ -303,16 +306,15 @@ export class LspInstance {
   }
 
   /**
-   * Terminate the tree (the seam escalates SIGTERM→`killGraceMs`→SIGKILL),
-   * then await leader and helper exit. The awaits are unbounded on purpose:
-   * the seam's escalation already committed to SIGKILL, so quiescence — not
-   * another timer — is the postcondition disposal owes its callers.
+   * Terminate the provider-managed range, then await the direct server result
+   * and whole-range quiescence. The awaits are unbounded on purpose because
+   * quiescence, not another timer, is the postcondition disposal owes callers.
    */
   private async forceTerminate(): Promise<void> {
     this.connection.terminate()
     await Promise.all([
       this.connection.closed,
-      this.connection.waitForProcessTreeExit(),
+      this.connection.waitForManagedRangeExit(),
     ])
   }
 }

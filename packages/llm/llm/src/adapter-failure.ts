@@ -5,6 +5,7 @@
  */
 
 import { HarnessError } from './error.ts'
+import type { BuiltinLlmFailureCode } from './error.ts'
 import type { LlmFailure } from './types.ts'
 
 /**
@@ -16,7 +17,7 @@ import type { LlmFailure } from './types.ts'
 export function normalizeLlmFailure(value: unknown): LlmFailure {
   const error = value instanceof Error
     ? value
-    : new HarnessError(thrownMessage(value), 'UNKNOWN', { cause: value })
+    : new HarnessError(thrownMessage(value), 'UNKNOWN' satisfies BuiltinLlmFailureCode, { cause: value })
   // Cross-package copies preserve own data but not class identity. Trust the
   // carried facts only when both own properties agree after validation.
   const carried = ownFailureSnapshot(error)
@@ -69,18 +70,21 @@ function failureSnapshot(value: unknown): LlmFailure | undefined {
     const status = candidate.status
     const providerRetryAfterMs = candidate.providerRetryAfterMs
     const requestId = candidate.requestId
+    const offloadImages = candidate.offloadImages
     if (typeof message !== 'string' || message.length === 0
       || typeof code !== 'string' || code.length === 0
       || (status !== undefined && (!Number.isInteger(status) || status < 100 || status > 599))
       || (providerRetryAfterMs !== undefined
         && (!Number.isFinite(providerRetryAfterMs) || providerRetryAfterMs <= 0))
-      || (requestId !== undefined && (typeof requestId !== 'string' || requestId.length === 0))) return undefined
+      || (requestId !== undefined && (typeof requestId !== 'string' || requestId.length === 0))
+      || (offloadImages !== undefined && (!Number.isSafeInteger(offloadImages) || offloadImages <= 0))) return undefined
     return Object.freeze({
       message,
       code,
       ...status === undefined ? {} : { status },
       ...providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs },
       ...requestId === undefined ? {} : { requestId },
+      ...offloadImages === undefined ? {} : { offloadImages },
     })
   } catch (_sdkFailureGetter) {
     return undefined
@@ -100,5 +104,5 @@ function errorMessage(error: Error): string {
 
 /** Trust only Harness-owned codes; third-party SDK codes are not our taxonomy. */
 function harnessErrorCode(error: Error): string {
-  return error instanceof HarnessError ? error.code : 'UNKNOWN'
+  return error instanceof HarnessError ? error.code : 'UNKNOWN' satisfies BuiltinLlmFailureCode
 }

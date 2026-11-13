@@ -6,9 +6,13 @@
  *    for create operations) so a symlink can never escape the whitelist;
  * 2. match the resolved absolute path against whitelist rules (prefix / exact
  *    / glob via regex), then enforce `allowedExtensions`;
- * 3. temporaryOverrides (user-authored, time-boxed) may grant one file outside
+ * 3. blacklist rules (v3.0, 2026-10-30 用户授权) are checked FIRST and deny
+ *    unconditionally — credentials, .git internals, system dirs and the policy
+ *    file itself can never be written even under `defaultPolicy: allow`;
+ * 4. temporaryOverrides (user-authored, time-boxed) may grant one file outside
  *    the whitelist until `expiresAt`, then expire automatically;
- * 4. everything else is denied (fail-close) — no blacklist concept.
+ * 5. leftover paths follow `defaultPolicy`: `allow` passes them (v3.0 open
+ *    mode), `deny` (historical) fails close.
  *
  * @module @deepseek-ai/dsh-guard-main-agent
  */
@@ -43,6 +47,8 @@ export interface TemporaryOverride {
 export interface PolicyData {
   readonly defaultPolicy: string
   readonly symlinkResolve: boolean
+  /** v3.0: paths that are ALWAYS denied, even when defaultPolicy is `allow`. */
+  readonly blacklist: readonly WhitelistRule[]
   readonly whitelist: readonly WhitelistRule[]
   readonly dynamicWhitelist?: readonly WhitelistRule[]
   readonly temporaryOverrides: readonly TemporaryOverride[]
@@ -82,6 +88,7 @@ export function parsePolicy(yamlText: string): PolicyData {
   return {
     defaultPolicy: typeof root.defaultPolicy === 'string' ? root.defaultPolicy : 'deny',
     symlinkResolve: root.symlinkResolve !== false,
+    blacklist: Array.isArray(root.blacklist) ? root.blacklist as WhitelistRule[] : [],
     whitelist: Array.isArray(root.whitelist) ? root.whitelist as WhitelistRule[] : [],
     dynamicWhitelist: Array.isArray(root.dynamicWhitelist) ? root.dynamicWhitelist as WhitelistRule[] : [],
     temporaryOverrides: Array.isArray(root.temporaryOverrides) ? root.temporaryOverrides as TemporaryOverride[] : [],
@@ -172,6 +179,17 @@ export function createFilePolicy(data: PolicyData, options: FilePolicyOptions): 
     const resolvedPath = await resolvePath(absolute, fs)
     const rules = [...data.whitelist, ...(data.dynamicWhitelist ?? [])]
 
+    // ⓪ blacklist hit -> deny unconditionally (v3.0: 黑名单优先于白名单).
+    for (const rule of data.blacklist) {
+      if (!matchRule(resolvedPath, rule)) continue
+      return {
+        allowed: false,
+        reason: `黑名单: ${rule.reason ?? rule.value}`,
+        resolvedPath,
+        matchedRule: rule.reason ?? rule.value,
+      }
+    }
+
     // ① whitelist hit -> extension gate -> allow.
     for (const rule of rules) {
       if (!matchRule(resolvedPath, rule)) continue
@@ -195,7 +213,17 @@ export function createFilePolicy(data: PolicyData, options: FilePolicyOptions): 
       }
     }
 
-    // ③ fail-close.
+    // ③ defaultPolicy: `allow` opens the leftover space (v3.0 2026-10-30).
+    if (data.defaultPolicy === 'allow') {
+      return {
+        allowed: true,
+        reason: 'defaultPolicy: allow（非黑名单路径默认放行，v3.0）',
+        resolvedPath,
+        matchedRule: 'defaultPolicy:allow',
+      }
+    }
+
+    // ④ fail-close (historical defaultPolicy: deny).
     const expired = data.temporaryOverrides.some((o) => {
       const candidate = path.resolve(cwd, o.filePath)
       return candidate === resolvedPath && Date.parse(o.expiresAt) < now()

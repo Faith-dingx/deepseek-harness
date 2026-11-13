@@ -13,8 +13,8 @@
  * @module @deepseek-ai/dsh-guard-main-agent
  */
 
-import crypto from 'node:crypto'
-import { CallId, boundContextSummary } from '@deepseek-ai/dsh-llm'
+import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
+import { ToolCallId, boundContextSummary } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { PolicyVerdict } from './types.ts'
@@ -82,7 +82,7 @@ export async function delegate(
 
   try {
     const result = await deps.tools.execute({
-      callId: CallId(`guard:${crypto.randomUUID()}`),
+      callId: ToolCallId(`guard:${randomUUID()}`),
       name: tool,
       arguments: {
         description: `guard 自动派发：${target}`,
@@ -91,7 +91,16 @@ export async function delegate(
       agent: deps.agent,
       signal: deps.signal,
     })
-    const outcome = result as { isError?: boolean; content?: unknown; error?: { message?: string } }
+    // 0.2.2: ToolsService.execute delegates to a registered ToolExecutor and
+    // settles a batch; read the first settled result back. A direct body
+    // dispatch (unit-test stubs) hands the result object itself.
+    type SettledOutcome = { isError?: boolean; content?: unknown; error?: { message?: string } }
+    type SettledResult = SettledOutcome & { value?: unknown }
+    const batch = result as { results?: Array<{ result?: SettledOutcome }> }
+    const direct = result as SettledResult
+    const outcome: SettledResult = Array.isArray(batch?.results?.[0]?.result?.content)
+      ? (batch.results[0]!.result as SettledResult)
+      : direct
     if (outcome.isError === true) {
       return { dispatched: true, ok: false, error: outcome.error?.message ?? 'subagent tool returned an error' }
     }

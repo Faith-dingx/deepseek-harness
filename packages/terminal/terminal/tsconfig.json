@@ -18,10 +18,10 @@
       "path": "../../core/agent"
     },
     {
-      "path": "../../util/brand"
+      "path": "../../util/error"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../util/brand"
     }
   ]
 }

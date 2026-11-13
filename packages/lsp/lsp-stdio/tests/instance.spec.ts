@@ -8,7 +8,7 @@ import { Context } from '@deepseek-ai/cordis'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 import { LspInstance, readHostSource } from '@deepseek-ai/dsh-lsp-stdio'
 import { encodeMessage } from '@deepseek-ai/dsh-lsp-stdio'
-import type { ConnectionWriter } from '@deepseek-ai/dsh-lsp-stdio/src/connection.ts'
+import type { ConnectionSpawner, ConnectionWriter } from '@deepseek-ai/dsh-lsp-stdio/src/connection.ts'
 import type { InstanceSpec } from '@deepseek-ai/dsh-lsp-stdio/src/instance.ts'
 import type { LspProviderQuery, LspQueryResult } from '@deepseek-ai/dsh-lsp'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
@@ -20,7 +20,7 @@ let root: string
 let ws: string
 let ctx: Context
 let fs: LocalFileSystem
-let live: LspInstance[] = []
+const live: LspInstance[] = []
 
 beforeEach(async () => {
   root = await realpath(await mkdtemp(join(tmpdir(), 'lsp-inst-')))
@@ -33,16 +33,19 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  for (const instance of live) await instance.dispose()
-  live = []
-  await ctx.fiber.dispose()
-  await rm(root, { recursive: true, force: true })
+  const instances = live.splice(0)
+  const ownedContext = ctx
+  const directory = root
+  for (const instance of instances) await instance.dispose()
+  await ownedContext.fiber.dispose()
+  await rm(directory, { recursive: true, force: true })
 })
 
 function makeInstance(
   env: Record<string, string> = {},
   overrides: Partial<InstanceSpec> = {},
   writer?: ConnectionWriter,
+  spawner: ConnectionSpawner = spawnSubprocess,
 ): LspInstance {
   const instance = new LspInstance({
     command: process.execPath,
@@ -57,7 +60,7 @@ function makeInstance(
     shutdownTimeoutMs: 200,
     killGraceMs: 200,
     ...overrides,
-  }, spawnSubprocess, writer)
+  }, spawner, writer)
   live.push(instance)
   return instance
 }
@@ -202,25 +205,48 @@ describe('LspInstance query and abort', () => {
     await instance.dispose()
   })
 
-  it('terminates when abort interrupts a backpressured didOpen write', async () => {
+  it('terminates when abort interrupts a backpressured didOpen write', async ({ task, signal }) => {
     // The fixture consumes initialized, then stops reading. A document larger than the stdio pipe
     // keeps didOpen's write callback pending until cancellation forces bounded process teardown.
     await writeFile(join(ws, 'a.ts'), 'x'.repeat(2_000_000))
     const marker = join(root, 'initialized.log')
+    const didOpenStarted = Promise.withResolvers<undefined>()
+    let didOpenFinished = false
+    let processClosed = false
     const instance = makeInstance({
       LSP_FAKE_INITIALIZED_MARKER: marker,
       LSP_FAKE_PAUSE_STDIN_AFTER_INITIALIZED: '1',
     }, {
       shutdownTimeoutMs: 100,
       killGraceMs: 100,
+    }, (stdin, message, done) => {
+      if ((message as { method?: unknown }).method !== 'textDocument/didOpen') {
+        stdin.write(encodeMessage(message), done)
+        return
+      }
+      stdin.write(encodeMessage(message), (error) => {
+        didOpenFinished = true
+        done(error)
+      })
+      didOpenStarted.resolve(undefined)
+    }, (spec) => {
+      const handle = spawnSubprocess(spec)
+      void Promise.allSettled([handle.done]).then(([result]) => { processClosed = result.status === 'fulfilled' })
+      return handle
     })
     const controller = new AbortController()
-    const pending = run(instance, 'goToDefinition', controller.signal)
-    await waitForFile(marker)
-    // Let the client enter the large didOpen write after the fixture has paused stdin.
-    await new Promise<void>(resolve => setTimeout(resolve, 100))
+    const outcome = run(instance, 'goToDefinition', controller.signal)
+      .then(() => undefined, (error: unknown) => error)
+    await waitForFile(marker, task.timeout, signal)
+    await didOpenStarted.promise
+    signal.throwIfAborted()
+    expect(didOpenFinished).toBe(false)
+    expect(processClosed).toBe(false)
     controller.abort(new Error('didOpen-abort'))
-    await expect(pending).rejects.toThrow(/didOpen-abort/)
+    const failure = await outcome
+    expect(() => { throw failure }).toThrow(/didOpen-abort/)
+    expect(didOpenFinished).toBe(true)
+    expect(processClosed).toBe(true)
     expect(instance.dead).toBe(true)
   })
 
@@ -229,24 +255,30 @@ describe('LspInstance query and abort', () => {
       shutdownTimeoutMs: 100,
       killGraceMs: 100,
     }, failingWriter('textDocument/didOpen'))
-    await expect(run(instance, 'goToDefinition')).rejects.toThrow()
+    await expect(run(instance, 'goToDefinition')).rejects.toMatchObject({ name: 'LspError', code: 'LSP_SERVER_EXITED' })
     expect(instance.dead).toBe(true)
   })
 
-  it('awaits process exit before rejecting a request write failure', async () => {
+  it('finishes teardown before rejecting a request write failure', async () => {
     const instance = makeInstance({}, {
       shutdownTimeoutMs: 100,
       killGraceMs: 100,
     }, failingWriter('textDocument/definition'))
-    // The pid is observed only to prove the owned subprocess reached quiescence before rejection.
-    const pid = (instance as unknown as { connection: { pid: number } }).connection.pid
-    await expect(run(instance, 'goToDefinition')).rejects.toThrow(/fixture textDocument\/definition failure/)
-    expect(processAlive(pid)).toBe(false)
+    await expect(run(instance, 'goToDefinition')).rejects.toMatchObject({
+      name: 'LspError',
+      code: 'LSP_SERVER_EXITED',
+      message: 'language server stopped accepting input: fixture textDocument/definition failure',
+    })
+    expect(instance.dead).toBe(true)
   })
 
   it('rejects when the server lacks the operation capability', async () => {
     const instance = makeInstance({ LSP_FAKE_CAPS: JSON.stringify({ definitionProvider: false }), LSP_FAKE_DEF: 'null' })
-    await expect(run(instance, 'goToDefinition')).rejects.toThrow(/does not support goToDefinition/)
+    await expect(run(instance, 'goToDefinition')).rejects.toMatchObject({
+      name: 'LspError',
+      code: 'LSP_UNSUPPORTED_OPERATION',
+      message: 'server does not support goToDefinition',
+    })
   })
 
   it('propagates a server error response even when a signal is supplied (not an abort)', async () => {
@@ -254,7 +286,11 @@ describe('LspInstance query and abort', () => {
     // without treating it as an abort.
     const instance = makeInstance({ LSP_FAKE_ERROR: '1' })
     const controller = new AbortController()
-    await expect(run(instance, 'goToDefinition', controller.signal)).rejects.toThrow(/server refused/)
+    await expect(run(instance, 'goToDefinition', controller.signal)).rejects.toMatchObject({
+      name: 'LspError',
+      code: 'LSP_SERVER_ERROR',
+      message: 'language server rejected textDocument/definition with JSON-RPC error -32000: server refused the request',
+    })
   })
 
   it('keeps a settled result but awaits teardown when didClose cannot be written', async () => {
@@ -268,6 +304,33 @@ describe('LspInstance query and abort', () => {
     })
     expect(instance.dead).toBe(true)
   })
+
+  it('reports the launch failure when the server executable cannot be spawned', async () => {
+    const instance = makeInstance({}, { command: join(root, 'missing-server') })
+    await expect(run(instance, 'goToDefinition')).rejects.toMatchObject({
+      name: 'LspError',
+      code: 'LSP_SPAWN_FAILED',
+      message: expect.stringMatching(/^language server process failed: .*ENOENT/) as string,
+    })
+    expect(instance.dead).toBe(true)
+  })
+
+  it.each([
+    ['a non-object result', 'null', 'LSP initialize result was not an object'],
+    ['no capabilities object', '{}', 'LSP initialize result had no capabilities object'],
+  ])('rejects an initialize result with %s', async (_label, result, message) => {
+    const script = 'let b=Buffer.alloc(0);'
+      + 'const fr=(s)=>{const x=Buffer.from(s);return Buffer.concat([Buffer.from(`Content-Length: ${x.length}\\r\\n\\r\\n`),x]);};'
+      + 'process.stdin.on("data",c=>{b=Buffer.concat([b,c]);const s=b.indexOf("\\r\\n\\r\\n");if(s<0)return;const len=Number(/(\\d+)/.exec(b.toString("ascii",0,s))[1]);const body=JSON.parse(b.toString("utf8",s+4,s+4+len));b=b.subarray(s+4+len);'
+      + `if(body.method==="initialize")process.stdout.write(fr(JSON.stringify({jsonrpc:"2.0",id:body.id,result:${result}})));});`
+    const instance = makeInstance({}, { args: ['-e', script], shutdownTimeoutMs: 100, killGraceMs: 100 })
+    await expect(run(instance, 'goToDefinition')).rejects.toMatchObject({
+      name: 'LspError',
+      code: 'LSP_MALFORMED_RESPONSE',
+      message,
+    })
+  })
+
 })
 
 describe('LspInstance disposal', () => {
@@ -312,7 +375,7 @@ describe('LspInstance disposal', () => {
     await expect(instance.dispose()).resolves.toBeUndefined()
   })
 
-  it('awaits a surviving process-tree helper on every concurrent dispose', async () => {
+  it('awaits a surviving managed-range helper on every concurrent dispose', async () => {
     const marker = join(root, 'helper.pid')
     const helper = 'process.on("SIGTERM",()=>{});setInterval(()=>{},1000);'
     const script = 'const{spawn}=require("node:child_process");const{writeFileSync}=require("node:fs");'
@@ -372,10 +435,10 @@ async function waitForProcessExit(pid: number, timeoutMs = 3_000): Promise<void>
 }
 
 /** Write normally except for one method whose callback receives a deterministic transport error. */
-function failingWriter(method: string): ConnectionWriter {
+function failingWriter(method: string, failure = new Error(`fixture ${method} failure`)): ConnectionWriter {
   return (stdin, message, done) => {
     if ((message as { method?: unknown }).method === method) {
-      queueMicrotask(() => { done(new Error(`fixture ${method} failure`)) })
+      queueMicrotask(() => { done(failure) })
       return
     }
     stdin.write(encodeMessage(message), done)
@@ -383,9 +446,10 @@ function failingWriter(method: string): ConnectionWriter {
 }
 
 /** Wait until a fixture marker exists, bounded so a broken handshake cannot hang the test. */
-async function waitForFile(path: string, timeoutMs = 3000): Promise<void> {
+async function waitForFile(path: string, timeoutMs: number, signal: AbortSignal): Promise<void> {
   const started = Date.now()
   for (;;) {
+    signal.throwIfAborted()
     try {
       await readFile(path)
       return

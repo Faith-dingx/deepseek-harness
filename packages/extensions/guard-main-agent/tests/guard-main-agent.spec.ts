@@ -1,10 +1,22 @@
 /**
- * End-to-end integration for the guard-main-agent pre-execute pipeline.
+ * End-to-end integration for the guard-main-agent pre-execute pipeline (0.2.2).
  *
- * Assembles a real cordis Context (SystemPrompt + ToolRuntime + AgentRegistry)
- * with the plugin, a real fixture workspace (dirs + symlink + whitelist YAML
- * generated at runtime), stub delegation tools, and a stubbed classifier.
- * Scenarios follow 计划-guard-main-agent T8 and 计划-主agent可改写文件清单 T6.
+ * Assembles a real cordis Context (SystemPrompt + ToolRuntime + AgentRegistry +
+ * SessionProjectionRegistry) with the plugin, a real fixture workspace (dirs +
+ * symlink + whitelist YAML generated at runtime), stub delegation tools, a
+ * native-style tool executor, and a stubbed classifier. Scenarios follow
+ * 计划-guard-main-agent T8 and 计划-主agent可改写文件清单 T6.
+ *
+ * 0.2.2 changes vs 0.1.5:
+ * - `defineContentToolFixture` moved to `@deepseek-ai/dsh-tool-testkit`
+ * - `Session.create` header now uses version 4 SessionHeader object
+ * - `Agent` interface gained required `model` and `inbox` fields
+ * - `tools.execute` requires a registered executor (`ctx.tools.setExecutor`)
+ *   — delegate.ts's auto-dispatch routes through `deps.tools.execute(...)`,
+ *   so we register a minimal executor that routes to the stub tool definitions.
+ * - `MessageSourceMap` no longer has catch-all `kind:'plugin'`; guard uses
+ *   its own `kind:'guard-main-agent'` + `form:'notice'` module augmentation
+ * - `continuation.ts` was deleted upstream; no test depends on it here.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -13,11 +25,13 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
-import { CallId, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
-import type { ToolExecution, PreToolDecision } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { type ToolExecutor, type ToolBatchInput, type ToolBatchResult, type ToolCallResult, type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import AgentRegistry, { type Agent, type Model, type Inbox } from '@deepseek-ai/dsh-agent'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { Session, SessionId, type UserMessage, type SessionHeader } from '@deepseek-ai/dsh-session'
+import type { ToolExecution, PreToolDecision, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import * as guardMainAgent from '../src/index.ts'
 
 const fixtureRoot = fileURLToPath(new URL('.fixtures/', import.meta.url))
@@ -72,26 +86,168 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+/** Minimal stub for the required `model` field on 0.2.2 Agent. */
+function stubModel(): Model {
+  return {
+    current: () => undefined,
+    select: () => {},
+  } as Model
+}
+
+/** Minimal stub for the required `inbox` field on 0.2.2 Agent. */
+function stubInbox(): Inbox {
+  return {
+    nextTurn: [],
+    nextStep: [],
+    clear: () => {},
+    append: () => {},
+    prepend: () => {},
+    replace: () => false,
+    remove: () => false,
+    splice: () => [],
+  } as Inbox
+}
+
 /** Fake agent with inject capture and a scriptable session. */
 function agentFor(cwd: string, id = 'guard-agent'): { agent: Agent; injected: UserMessage[]; session: Session } {
-  const session = Session.create(SessionId(id), [], { version: 0, id: SessionId(id), createdAt: 0, cwd })
+  const sessionId = SessionId(id)
+  const session = Session.create(sessionId, [], {
+    version: 4,
+    isSeeded: false,
+    id: sessionId,
+    createdAt: 0,
+    cwd,
+  } as SessionHeader)
   const injected: UserMessage[] = []
   const agent: Agent = {
-    id: SessionId(id),
+    id: sessionId,
     options: {},
     session,
-    inbox: {} as never,
+    model: stubModel(),
+    inbox: stubInbox(),
     status: 'running',
     ctx: new Context(),
     send: () => {},
     followup: () => {},
     steer: () => {},
-    inject: (message) => { injected.push(message) },
+    inject: (message: UserMessage) => { injected.push(message) },
     cancel() {},
     runMaintenance: task => task(new AbortController().signal),
     whenIdle: () => Promise.resolve(),
-  }
+  } as Agent
   return { agent, injected, session }
+}
+
+/**
+ * Minimal tool executor that routes calls to registered tool definitions.
+ * delegate.ts calls `deps.tools.execute(...)` with a single-call shape
+ * ({callId, name, arguments, agent, signal}), which `ToolsService.execute`
+ * hands to the registered executor. The executor accepts both the batch
+ * shape ({calls}) and that single-call shape, looks up the tool by name in
+ * the ctx.tools registry, and invokes its execute body directly.
+ *
+ * A caller-aborted signal yields canonical ABORTED_BEFORE_DISPATCH results
+ * without running any tool body (mirrors the native executor's pipeline
+ * cancellation handling, 场景H).
+ */
+function createStubExecutor(ctx: Context): ToolExecutor {
+  /**
+   * One stub tool result: the body's canonical value is its content array;
+   * present it as a content-bearing success. Content-tool fixtures
+   * (defineContentToolFixture) already yield a JSON content array.
+   */
+  const unknownResult = (name: string): ToolExecutionResult => ({
+    isError: true,
+    content: [{ type: 'text' as const, text: `unknown tool: ${name}` }],
+    error: { name: 'UNKNOWN_TOOL', message: `unknown tool: ${name}` },
+  }) as ToolExecutionResult
+  const abortedResult = (): ToolExecutionResult => ({
+    isError: true,
+    content: [{ type: 'text' as const, text: 'Error: tool call aborted before dispatch' }],
+    error: {
+      message: 'tool call aborted before dispatch',
+      info: { name: 'AbortError', code: 'ABORTED_BEFORE_DISPATCH' },
+    },
+  }) as ToolExecutionResult
+
+  return {
+    describe: () => ({ schemas: [], knownNames: [] }),
+    async execute(input: ToolBatchInput & { callId?: unknown; name?: string; arguments?: unknown }): Promise<ToolBatchResult> {
+      // Single-call shape from guard delegation (delegate.ts): honor caller
+      // cancellation without dispatching (native-executor semantics, 场景H).
+      if (!Array.isArray(input.calls)) {
+        const results = input.signal.aborted
+          ? [{ callId: input.callId as ToolCallResult['callId'], result: abortedResult() }]
+          : []
+        if (results.length === 0) {
+          const tool = ctx.tools.executable(input.name as string, input.agent)
+          const runBody = async (): Promise<unknown> => {
+            if (tool === undefined) throw new Error(`unknown tool: ${input.name}`)
+            const parsed = typeof input.arguments === 'string' ? JSON.parse(input.arguments) : input.arguments
+            const exec = {
+              token: Symbol('exec'),
+              callId: input.callId,
+              rootCallId: input.callId,
+              name: input.name,
+              arguments: parsed,
+              agent: input.agent,
+              signal: input.signal,
+              deferContext: () => {},
+              concludeTurn: () => {},
+            } as unknown as ToolRunContext
+            const raw = await tool.execute(parsed, exec)
+            // The tool body's canonical value IS its content array; wrap it
+            // into a settled ToolExecutionResult for the batch contract.
+            return {
+              isError: false,
+              value: raw,
+              content: (Array.isArray(raw) ? raw : [raw]) as ToolExecutionResult['content'],
+            }
+          }
+          results.push({
+            callId: input.callId as ToolCallResult['callId'],
+            result: (await runBody()) as ToolExecutionResult,
+          })
+        }
+        return { results, additionalContexts: [], concluded: false }
+      }
+      // Batch shape.
+      const results: ToolCallResult[] = []
+      for (const call of input.calls) {
+        if (input.signal.aborted) {
+          results.push({ callId: call.id, result: abortedResult() })
+          continue
+        }
+        const tool = ctx.tools.executable(call.name, input.agent)
+        if (tool === undefined) {
+          results.push({ callId: call.id, result: unknownResult(call.name) })
+          continue
+        }
+        const parsed = typeof call.arguments === 'string' ? JSON.parse(call.arguments) : call.arguments
+        const exec = {
+          token: Symbol('exec'),
+          callId: call.id,
+          rootCallId: call.id,
+          name: call.name,
+          arguments: parsed,
+          agent: input.agent,
+          signal: input.signal,
+          deferContext: () => {},
+          concludeTurn: () => {},
+        } as unknown as ToolRunContext
+        const raw = await tool.execute(parsed, exec)
+        results.push({
+          callId: call.id,
+          result: {
+            isError: false,
+            value: raw,
+            content: (Array.isArray(raw) ? raw : [raw]) as ToolExecutionResult['content'],
+          } as ToolExecutionResult,
+        })
+      }
+      return { results, additionalContexts: [], concluded: false }
+    },
+  }
 }
 
 async function setup(
@@ -103,6 +259,7 @@ async function setup(
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(guardMainAgent, {
     classifierEndpoint: 'http://classifier:9888/v1/chat/completions',
@@ -135,6 +292,9 @@ async function setup(
       return [{ type: 'text', text: 'delegated-check-ok' }]
     },
   }))
+  // 0.2.2: delegate.ts's tools.execute requires a registered executor.
+  // Route to the stub tool definitions above.
+  ctx.tools.setExecutor(createStubExecutor(ctx))
   return ctx
 }
 
@@ -149,8 +309,8 @@ async function preExecute(
   const execSignal = signal ?? new AbortController().signal
   const exec = {
     token: Symbol('exec'),
-    callId: CallId('integration-call'),
-    rootCallId: CallId('integration-call'),
+    callId: ToolCallId('integration-call'),
+    rootCallId: ToolCallId('integration-call'),
     name,
     arguments: args,
     ...agent !== undefined ? { agent } : {},
@@ -233,8 +393,8 @@ describe('guard-main-agent integration (tools/pre-execute)', () => {
     const bash = await preExecute(ctx, agent, 'bash', { command: 'rm -rf /tmp/x' })
     expect(bash.decision.kind).toBe('deny')
     expect(bash.nextCalls).toBe(0)
-    // Each read-only call attempted the classifier once (cache is per-task).
-    expect(track.code).toBe(1) // only the blocked bash delegated
+    // Only the blocked bash delegated; read-only calls did not.
+    expect(track.code).toBe(1)
   })
 
   it('场景S1: shell hard-block — bash rm denies deterministically, classifier never consulted', async () => {
@@ -268,6 +428,19 @@ describe('guard-main-agent integration (tools/pre-execute)', () => {
     expect(nextCalls).toBe(0)
     expect(classifierCalls).toBe(0)
     expect(track.code).toBe(1)
+  })
+
+  it('场景S2b: rm confined to the workspace is allowed (2026-10-30 用户授权)', async () => {
+    let classifierCalls = 0
+    const ctx = await setup(async () => {
+      classifierCalls += 1
+      return new Response('', { status: 200 })
+    })
+    const { agent } = agentFor(ws)
+    const { decision, nextCalls } = await preExecute(ctx, agent, 'bash', { command: 'rm -rf build/cache' })
+    expect(decision.kind).toBe('allow')
+    expect(nextCalls).toBe(1)
+    expect(classifierCalls).toBe(0) // still bypasses the classifier
   })
 
   it('场景S3: non-rm shell commands still flow through the classifier path', async () => {

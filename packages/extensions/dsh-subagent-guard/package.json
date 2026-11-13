@@ -24,10 +24,7 @@
   "files": [
     "lib/index.js",
     "lib/index.d.ts",
-    "lib/index.js.map",
-    "lib/invariant.js",
-    "lib/invariant.d.ts",
-    "lib/invariant.js.map"
+    "lib/index.js.map"
   ],
   "license": "MIT",
   "peerDependencies": {
